@@ -1,0 +1,30 @@
+[package]
+name = "wp-connectors-labs"
+version = "0.1.0"
+edition = "2024"
+description = "Experimental connectors for warp-parse: dmdb"
+authors = ["WP Labs Team"]
+license = "Apache-2.0"
+repository = "https://github.com/wp-labs/wp-connectors"
+
+[features]
+default = []
+dmdb = ["dep:odbc-api"]
+
+[dependencies]
+wp-connector-api = "0.9"
+wp-model-core = "0.8"
+wp-log = "0.3"
+wp-error = "0.9"
+wp-conf-base = "0.3"
+orion-error = "0.7"
+orion_conf = { version = "0.6", features = ["yaml", "toml"] }
+
+async-trait = "0.1"
+anyhow = "1.0"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+odbc-api = { version = "24.1", default-features = false, features = ["odbc_version_3_5"], optional = true }
+thiserror = "2"

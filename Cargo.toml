@@ -28,3 +28,9 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 odbc-api = { version = "24.1", default-features = false, features = ["odbc_version_3_5"], optional = true }
 thiserror = "2"
+
+[dev-dependencies]
+wp-connector-test-utils = { version = "0.1.1", git = "https://github.com/wp-labs/wp-connector-test-utils.git" }
+httpmock = "0.8"
+quickcheck = "1.0"
+quickcheck_macros = "1.0"

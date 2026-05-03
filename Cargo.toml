@@ -1,6 +1,6 @@
 [package]
 name = "wp-connectors-labs"
-version = "0.1.0"
+version = "0.1.1" #@gxl:set(version)
 edition = "2024"
 description = "Experimental connectors for warp-parse: dmdb"
 authors = ["WP Labs Team"]

@@ -2,10 +2,12 @@ use super::common::{
     DmdbConnectionHandle, connect_shared_blocking, escape_sql_literal, quote_identifier,
 };
 use super::config::DmdbSourceConf;
+use super::error::{DmdbReason, DmdbResult, dmdb_err};
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use odbc_api::sys::SqlDataType;
 use odbc_api::{Cursor, DataType};
+use orion_error::prelude::{SourceErr, SourceRawErr};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,7 +18,7 @@ use wp_log::{info_data, warn_data};
 use wp_model_core::event_id::next_wp_event_id;
 use wp_model_core::raw::RawData;
 
-type AnyResult<T> = anyhow::Result<T>;
+type AnyResult<T> = DmdbResult<T>;
 
 const DEFAULT_BATCH: usize = 512;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
@@ -63,7 +65,7 @@ impl DmdbSource {
     }
 
     /// 根据配置建立达梦增量 Source，并在启动阶段完成游标计划探测。
-    pub async fn new(key: String, tags: Tags, config: &DmdbSourceConf) -> AnyResult<Self> {
+    pub(crate) async fn new(key: String, tags: Tags, config: &DmdbSourceConf) -> AnyResult<Self> {
         let table = required_opt_field("dmdb.table", &config.table)?;
         let cursor_column = required_opt_field("dmdb.cursor_column", &config.cursor_column)?;
         let cursor_type = CursorType::from_config(
@@ -80,7 +82,7 @@ impl DmdbSource {
             let conf = config.conn.clone();
             task::spawn_blocking(move || connect_shared_blocking(&conf))
                 .await
-                .map_err(|err| anyhow::anyhow!("spawn dmdb source connect task failed: {err}"))??
+                .source_raw_err(DmdbReason::Runtime, "spawn dmdb source connect task failed")??
         };
 
         let schema = normalized_schema(config.conn.schema.as_deref());
@@ -100,13 +102,16 @@ impl DmdbSource {
                 )
             })
             .await
-            .map_err(|err| anyhow::anyhow!("spawn dmdb source cursor plan task failed: {err}"))??
+            .source_raw_err(
+                DmdbReason::Runtime,
+                "spawn dmdb source cursor plan task failed",
+            )??
         };
 
         let start_from_format =
             parse_start_from_format(config.start_from_format.as_deref(), cursor_type)?;
         let session_offset = FixedOffset::east_opt(0)
-            .ok_or_else(|| anyhow::anyhow!("build UTC fixed offset failed"))?;
+            .ok_or_else(|| dmdb_err(DmdbReason::Time, "build UTC fixed offset failed"))?;
         // `start_from` 会先标准化为数据库可稳定比较的文本形式。
         let start_from = normalize_optional_start_from(
             &cursor_plan,
@@ -197,9 +202,10 @@ impl DmdbSource {
 
     /// 在阻塞线程中执行一轮批量查询，避免 ODBC 调用阻塞异步 runtime。
     async fn query_next_batch(&self) -> SourceResult<Vec<(String, String)>> {
-        let connection = self.connection.clone().ok_or_else(|| {
-            SourceReason::Other("dmdb source connection is not initialized".into())
-        })?;
+        let connection = self
+            .connection
+            .clone()
+            .ok_or_else(|| SourceReason::other("dmdb source connection is not initialized"))?;
         let lower_bound = self.lower_bound_raw().map(std::string::ToString::to_string);
         let query_timeout_secs = self.query_timeout_secs;
         let sql = self.build_batch_query();
@@ -208,10 +214,8 @@ impl DmdbSource {
             query_next_batch_blocking(connection, sql, lower_bound, query_timeout_secs)
         })
         .await
-        .map_err(|err| SourceReason::Other(format!("spawn dmdb source query task failed: {err}")))?
-        .map_err(|err| {
-            SourceReason::SupplierError(format!("dmdb query batch failed: {err}")).into()
-        })
+        .source_raw_err(SourceReason::Other, "spawn dmdb source query task failed")?
+        .source_err(SourceReason::SupplierError, "dmdb query batch failed")
     }
 
     /// 获取本轮查询应使用的 lower bound，优先使用 checkpoint 中的最新游标。
@@ -242,23 +246,28 @@ impl DmdbSource {
             return Ok(None);
         }
 
-        let contents = std::fs::read_to_string(path)?;
+        let contents = std::fs::read_to_string(path)
+            .source_err(DmdbReason::Io, "read dmdb checkpoint failed")?;
         if contents.trim().is_empty() {
             return Ok(None);
         }
 
-        let state: CheckpointState = serde_json::from_str(&contents).map_err(|err| {
-            anyhow::anyhow!(
-                "dmdb checkpoint file {} is invalid: {}; if you changed source cursor config, delete this checkpoint and restart",
-                path.display(),
-                err
-            )
-        })?;
+        let state: CheckpointState = serde_json::from_str(&contents)
+            .source_raw_err(
+                DmdbReason::Checkpoint,
+                format!(
+                    "dmdb checkpoint file {} is invalid; if you changed source cursor config, delete this checkpoint and restart",
+                    path.display()
+                ),
+            )?;
         validate_checkpoint_state(&state, cursor_column, cursor_plan).map_err(|err| {
-            anyhow::anyhow!(
+            dmdb_err(
+                DmdbReason::Checkpoint,
+                format!(
                 "dmdb checkpoint {} is incompatible with current config: {}; if you changed cursor_column/cursor_type or want to restart from a new cursor, delete this checkpoint and restart",
                 path.display(),
                 err
+                )
             )
         })?;
         Ok(Some(state))
@@ -266,9 +275,8 @@ impl DmdbSource {
 
     /// 将当前批次最后一条游标持久化到本地 checkpoint 文件。
     fn persist_checkpoint(&mut self, last_cursor_raw: String) -> SourceResult<()> {
-        ensure_checkpoint_dir(&self.checkpoint_path).map_err(|err| {
-            SourceReason::Other(format!("dmdb ensure checkpoint dir failed: {err}"))
-        })?;
+        ensure_checkpoint_dir(&self.checkpoint_path)
+            .source_err(SourceReason::Other, "dmdb ensure checkpoint dir failed")?;
 
         // 仅在一批事件成功组装后持久化游标，避免“游标前推但事件未发出”的不一致状态。
         let state = CheckpointState {
@@ -278,12 +286,11 @@ impl DmdbSource {
             last_cursor_raw,
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
-        let content = serde_json::to_string_pretty(&state).map_err(|err| {
-            SourceReason::Other(format!("dmdb serialize checkpoint failed: {err}"))
-        })?;
+        let content = serde_json::to_string_pretty(&state)
+            .source_raw_err(SourceReason::Other, "dmdb serialize checkpoint failed")?;
 
         std::fs::write(&self.checkpoint_path, content)
-            .map_err(|err| SourceReason::Other(format!("dmdb write checkpoint failed: {err}")))?;
+            .source_err(SourceReason::Other, "dmdb write checkpoint failed")?;
         self.checkpoint = Some(state);
         Ok(())
     }
@@ -387,7 +394,10 @@ impl CursorType {
         match raw {
             "int" => Ok(Self::Int),
             "time" => Ok(Self::Time),
-            other => anyhow::bail!("unsupported dmdb cursor_type: {other}"),
+            other => Err(dmdb_err(
+                DmdbReason::Config,
+                format!("unsupported dmdb cursor_type: {other}"),
+            )),
         }
     }
 
@@ -406,19 +416,28 @@ impl CursorType {
     ) -> AnyResult<()> {
         let Some(start_from) = start_from else {
             if start_from_format.is_some() {
-                anyhow::bail!("dmdb.start_from_format requires dmdb.start_from");
+                return Err(dmdb_err(
+                    DmdbReason::Config,
+                    "dmdb.start_from_format requires dmdb.start_from",
+                ));
             }
             return Ok(());
         };
 
         if start_from.trim().is_empty() {
-            anyhow::bail!(
-                "dmdb.start_from must not be empty for {} cursor",
-                self.as_str()
-            );
+            return Err(dmdb_err(
+                DmdbReason::Config,
+                format!(
+                    "dmdb.start_from must not be empty for {} cursor",
+                    self.as_str()
+                ),
+            ));
         }
         if start_from_format.is_some() && self != CursorType::Time {
-            anyhow::bail!("dmdb.start_from_format is only supported for time cursor");
+            return Err(dmdb_err(
+                DmdbReason::Config,
+                "dmdb.start_from_format is only supported for time cursor",
+            ));
         }
         Ok(())
     }
@@ -437,22 +456,24 @@ impl CursorType {
                 } else if is_numeric_data_type(data_type, type_name) {
                     Ok(LowerBoundBinding::Numeric)
                 } else {
-                    anyhow::bail!(
-                        "dmdb source cursor_column {} must be numeric-like for cursor_type=int, got {} / {:?}",
-                        cursor_column,
-                        type_name,
-                        data_type
-                    );
+                    Err(dmdb_err(
+                        DmdbReason::Cursor,
+                        format!(
+                            "dmdb source cursor_column {} must be numeric-like for cursor_type=int, got {} / {:?}",
+                            cursor_column, type_name, data_type
+                        ),
+                    ))
                 }
             }
             Self::Time => {
                 let Some(binding) = time_lower_bound_binding(data_type, type_name) else {
-                    anyhow::bail!(
-                        "dmdb source cursor_column {} must be time-like for cursor_type=time, got {} / {:?}",
-                        cursor_column,
-                        type_name,
-                        data_type
-                    );
+                    return Err(dmdb_err(
+                        DmdbReason::Cursor,
+                        format!(
+                            "dmdb source cursor_column {} must be time-like for cursor_type=time, got {} / {:?}",
+                            cursor_column, type_name, data_type
+                        ),
+                    ));
                 };
                 Ok(binding)
             }
@@ -472,22 +493,28 @@ impl CursorPlan {
         // 元数据探测在启动时完成，避免运行中才发现类型不匹配。
         let columns = query_table_columns(connection, schema, table)?;
         if columns.is_empty() {
-            anyhow::bail!(
-                "dmdb source table metadata not found for {}.{}",
-                schema.unwrap_or(""),
-                table
-            );
+            return Err(dmdb_err(
+                DmdbReason::Database,
+                format!(
+                    "dmdb source table metadata not found for {}.{}",
+                    schema.unwrap_or(""),
+                    table
+                ),
+            ));
         }
 
         let cursor_meta = columns
             .iter()
             .find(|column| column.name.eq_ignore_ascii_case(cursor_column))
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "dmdb source cursor_column not found: {}.{}.{}",
-                    schema.unwrap_or(""),
-                    table,
-                    cursor_column
+                dmdb_err(
+                    DmdbReason::Cursor,
+                    format!(
+                        "dmdb source cursor_column not found: {}.{}.{}",
+                        schema.unwrap_or(""),
+                        table,
+                        cursor_column
+                    ),
                 )
             })?;
 
@@ -528,18 +555,27 @@ impl CursorPlan {
     /// 校验 lower bound 文本能否被当前游标策略接受。
     fn validate_lower_bound(&self, raw: &str, field_name: &str) -> AnyResult<()> {
         if raw.trim().is_empty() {
-            anyhow::bail!("{field_name} must not be empty");
+            return Err(dmdb_err(
+                DmdbReason::Cursor,
+                format!("{field_name} must not be empty"),
+            ));
         }
         match self.lower_bound_binding {
             LowerBoundBinding::Integer => {
-                raw.parse::<i64>()
-                    .map(|_| ())
-                    .map_err(|err| anyhow::anyhow!("{field_name} must be an integer: {err}"))?;
+                raw.parse::<i64>().map(|_| ()).map_err(|err| {
+                    dmdb_err(
+                        DmdbReason::Cursor,
+                        format!("{field_name} must be an integer: {err}"),
+                    )
+                })?;
             }
             LowerBoundBinding::Numeric => {
-                raw.parse::<f64>()
-                    .map(|_| ())
-                    .map_err(|err| anyhow::anyhow!("{field_name} must be numeric-like: {err}"))?;
+                raw.parse::<f64>().map(|_| ()).map_err(|err| {
+                    dmdb_err(
+                        DmdbReason::Cursor,
+                        format!("{field_name} must be numeric-like: {err}"),
+                    )
+                })?;
             }
             LowerBoundBinding::Date
             | LowerBoundBinding::Timestamp
@@ -578,35 +614,49 @@ fn query_next_batch_blocking(
 ) -> AnyResult<Vec<(String, String)>> {
     let conn_guard = connection
         .lock()
-        .map_err(|_| anyhow::anyhow!("lock dmdb source connection fail"))?;
+        .map_err(|_| dmdb_err(DmdbReason::Lock, "lock dmdb source connection fail"))?;
     let Some(mut cursor) = conn_guard
         .execute(sql.as_str(), (), query_timeout_secs)
-        .map_err(|err| anyhow::anyhow!("execute dmdb source sql failed: {err}, sql: {sql}"))?
+        .map_err(|err| {
+            dmdb_err(
+                DmdbReason::Database,
+                format!("execute dmdb source sql failed: {err}, sql: {sql}"),
+            )
+        })?
     else {
         return Ok(Vec::new());
     };
 
     // 查询结果固定为两列：游标值 + JSON payload。
     let mut out = Vec::new();
-    while let Some(mut row) = cursor.next_row()? {
+    while let Some(mut row) = cursor
+        .next_row()
+        .source_raw_err(DmdbReason::Database, "read next dmdb source row failed")?
+    {
         let mut cursor_buf = Vec::new();
         let mut payload_buf = Vec::new();
         let has_cursor = row
             .get_text(1, &mut cursor_buf)
-            .map_err(|err| anyhow::anyhow!("read dmdb cursor_value failed: {err}"))?;
+            .source_raw_err(DmdbReason::Database, "read dmdb cursor_value failed")?;
         if !has_cursor {
-            anyhow::bail!("dmdb source cursor_value must not be NULL");
+            return Err(dmdb_err(
+                DmdbReason::Database,
+                "dmdb source cursor_value must not be NULL",
+            ));
         }
         let has_payload = row
             .get_text(2, &mut payload_buf)
-            .map_err(|err| anyhow::anyhow!("read dmdb payload failed: {err}"))?;
+            .source_raw_err(DmdbReason::Database, "read dmdb payload failed")?;
         if !has_payload {
-            anyhow::bail!("dmdb source payload must not be NULL");
+            return Err(dmdb_err(
+                DmdbReason::Database,
+                "dmdb source payload must not be NULL",
+            ));
         }
         let cursor_raw = String::from_utf8(cursor_buf)
-            .map_err(|err| anyhow::anyhow!("dmdb cursor_value is not valid utf-8: {err}"))?;
+            .source_raw_err(DmdbReason::Parse, "dmdb cursor_value is not valid utf-8")?;
         let payload = String::from_utf8(payload_buf)
-            .map_err(|err| anyhow::anyhow!("dmdb payload is not valid utf-8: {err}"))?;
+            .source_raw_err(DmdbReason::Parse, "dmdb payload is not valid utf-8")?;
         out.push((cursor_raw, payload));
     }
     Ok(out)
@@ -617,27 +667,39 @@ fn query_table_columns(
     schema: Option<&str>,
     table: &str,
 ) -> AnyResult<Vec<DmdbColumnMeta>> {
-    let conn_guard = connection
-        .lock()
-        .map_err(|_| anyhow::anyhow!("lock dmdb source connection for metadata fail"))?;
+    let conn_guard = connection.lock().map_err(|_| {
+        dmdb_err(
+            DmdbReason::Lock,
+            "lock dmdb source connection for metadata fail",
+        )
+    })?;
     let schema_pattern = schema.unwrap_or("");
     let table_pattern = table;
     // 通过 ODBC 元数据接口读取列顺序与类型，供查询构造和 JSON 序列化复用。
     let mut rows = Vec::new();
-    for row_result in conn_guard.columns("", schema_pattern, table_pattern, "%")? {
-        let row = row_result?;
-        let table_name = row.table.as_str().map_err(|err| {
-            anyhow::anyhow!("decode dmdb table metadata table name failed: {err}")
-        })?;
+    for row_result in conn_guard
+        .columns("", schema_pattern, table_pattern, "%")
+        .source_raw_err(
+            DmdbReason::Database,
+            "query dmdb table columns metadata failed",
+        )?
+    {
+        let row = row_result
+            .source_raw_err(DmdbReason::Database, "read dmdb table metadata row failed")?;
+        let table_name = row.table.as_str().source_raw_err(
+            DmdbReason::Parse,
+            "decode dmdb table metadata table name failed",
+        )?;
         let Some(table_name) = table_name else {
             continue;
         };
         if !table_name.eq_ignore_ascii_case(table) {
             continue;
         }
-        let schema_name = row.schema.as_str().map_err(|err| {
-            anyhow::anyhow!("decode dmdb table metadata schema name failed: {err}")
-        })?;
+        let schema_name = row.schema.as_str().source_raw_err(
+            DmdbReason::Parse,
+            "decode dmdb table metadata schema name failed",
+        )?;
         if let Some(expected_schema) = schema
             && let Some(actual_schema) = schema_name
             && !actual_schema.eq_ignore_ascii_case(expected_schema)
@@ -647,12 +709,23 @@ fn query_table_columns(
         let column_name = row
             .column_name
             .as_str()
-            .map_err(|err| anyhow::anyhow!("decode dmdb table metadata column name failed: {err}"))?
-            .ok_or_else(|| anyhow::anyhow!("dmdb table metadata column name is NULL"))?;
+            .source_raw_err(
+                DmdbReason::Parse,
+                "decode dmdb table metadata column name failed",
+            )?
+            .ok_or_else(|| {
+                dmdb_err(
+                    DmdbReason::Database,
+                    "dmdb table metadata column name is NULL",
+                )
+            })?;
         let type_name = row
             .type_name
             .as_str()
-            .map_err(|err| anyhow::anyhow!("decode dmdb table metadata type name failed: {err}"))?
+            .source_raw_err(
+                DmdbReason::Parse,
+                "decode dmdb table metadata type name failed",
+            )?
             .unwrap_or("")
             .to_string();
         let data_type = DataType::new(
@@ -817,25 +890,32 @@ fn validate_checkpoint_state(
     cursor_plan: &CursorPlan,
 ) -> AnyResult<()> {
     if state.version != CHECKPOINT_VERSION {
-        anyhow::bail!(
-            "dmdb checkpoint version mismatch: expect {}, got {}",
-            CHECKPOINT_VERSION,
-            state.version
-        );
+        return Err(dmdb_err(
+            DmdbReason::Checkpoint,
+            format!(
+                "dmdb checkpoint version mismatch: expect {}, got {}",
+                CHECKPOINT_VERSION, state.version
+            ),
+        ));
     }
     if state.cursor_column != cursor_column {
-        anyhow::bail!(
-            "dmdb checkpoint cursor_column mismatch: expect {}, got {}",
-            cursor_column,
-            state.cursor_column
-        );
+        return Err(dmdb_err(
+            DmdbReason::Checkpoint,
+            format!(
+                "dmdb checkpoint cursor_column mismatch: expect {}, got {}",
+                cursor_column, state.cursor_column
+            ),
+        ));
     }
     if state.cursor_type != cursor_plan.cursor_type.as_str() {
-        anyhow::bail!(
-            "dmdb checkpoint cursor_type mismatch: expect {}, got {}",
-            cursor_plan.cursor_type.as_str(),
-            state.cursor_type
-        );
+        return Err(dmdb_err(
+            DmdbReason::Checkpoint,
+            format!(
+                "dmdb checkpoint cursor_type mismatch: expect {}, got {}",
+                cursor_plan.cursor_type.as_str(),
+                state.cursor_type
+            ),
+        ));
     }
     cursor_plan.validate_lower_bound(&state.last_cursor_raw, "dmdb checkpoint last_cursor_raw")
 }
@@ -846,7 +926,7 @@ fn required_opt_field<'a>(name: &str, value: &'a Option<String>) -> AnyResult<&'
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{name} must not be empty"))
+        .ok_or_else(|| dmdb_err(DmdbReason::Config, format!("{name} must not be empty")))
 }
 
 /// 生成当前 Source 对应的 checkpoint 文件路径。
@@ -857,7 +937,8 @@ fn checkpoint_path(source_key: &str) -> PathBuf {
 /// 确保 checkpoint 目录存在，便于后续写入。
 fn ensure_checkpoint_dir(path: &Path) -> AnyResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .source_err(DmdbReason::Io, "create dmdb checkpoint dir failed")?;
     }
     Ok(())
 }
@@ -881,7 +962,10 @@ fn parse_start_from_format(
         return Ok(None);
     };
     if cursor_type != CursorType::Time {
-        anyhow::bail!("dmdb.start_from_format is only supported for time cursor");
+        return Err(dmdb_err(
+            DmdbReason::Config,
+            "dmdb.start_from_format is only supported for time cursor",
+        ));
     }
     let kind = match raw {
         "unix" | "unix_s" => StartFromFormatKind::UnixSeconds,
@@ -962,11 +1046,16 @@ fn parse_date_by_format(
             .date_naive()),
         StartFromFormatKind::Pattern => {
             if pattern_has_offset(&format.raw) {
-                Ok(DateTime::parse_from_str(raw, &format.raw)?.date_naive())
+                Ok(DateTime::parse_from_str(raw, &format.raw)
+                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
+                    .date_naive())
             } else if pattern_has_time(&format.raw) {
-                Ok(NaiveDateTime::parse_from_str(raw, &format.raw)?.date())
+                Ok(NaiveDateTime::parse_from_str(raw, &format.raw)
+                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
+                    .date())
             } else {
-                Ok(NaiveDate::parse_from_str(raw, &format.raw)?)
+                NaiveDate::parse_from_str(raw, &format.raw)
+                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")
             }
         }
     }
@@ -987,13 +1076,17 @@ fn parse_timestamp_by_format(
             .naive_local()),
         StartFromFormatKind::Pattern => {
             if pattern_has_offset(&format.raw) {
-                Ok(DateTime::parse_from_str(raw, &format.raw)?.naive_local())
+                Ok(DateTime::parse_from_str(raw, &format.raw)
+                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
+                    .naive_local())
             } else if pattern_has_time(&format.raw) {
-                Ok(NaiveDateTime::parse_from_str(raw, &format.raw)?)
+                NaiveDateTime::parse_from_str(raw, &format.raw)
+                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")
             } else {
-                Ok(NaiveDate::parse_from_str(raw, &format.raw)?
+                Ok(NaiveDate::parse_from_str(raw, &format.raw)
+                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
                     .and_hms_opt(0, 0, 0)
-                    .ok_or_else(|| anyhow::anyhow!("dmdb.start_from parse failed"))?)
+                    .ok_or_else(|| dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed"))?)
             }
         }
     }
@@ -1014,14 +1107,17 @@ fn parse_timestamptz_by_format(
         }
         StartFromFormatKind::Pattern => {
             if pattern_has_offset(&format.raw) {
-                Ok(DateTime::parse_from_str(raw, &format.raw)?)
+                DateTime::parse_from_str(raw, &format.raw)
+                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")
             } else if pattern_has_time(&format.raw) {
-                let naive = NaiveDateTime::parse_from_str(raw, &format.raw)?;
+                let naive = NaiveDateTime::parse_from_str(raw, &format.raw)
+                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?;
                 bind_naive_to_fixed_offset(naive, session_offset, "dmdb.start_from")
             } else {
-                let naive = NaiveDate::parse_from_str(raw, &format.raw)?
+                let naive = NaiveDate::parse_from_str(raw, &format.raw)
+                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
                     .and_hms_opt(0, 0, 0)
-                    .ok_or_else(|| anyhow::anyhow!("dmdb.start_from parse failed"))?;
+                    .ok_or_else(|| dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed"))?;
                 bind_naive_to_fixed_offset(naive, session_offset, "dmdb.start_from")
             }
         }
@@ -1054,7 +1150,7 @@ fn parse_timestamp_fallback(raw: &str, session_offset: FixedOffset) -> AnyResult
     if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         return date
             .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| anyhow::anyhow!("dmdb.start_from parse failed"));
+            .ok_or_else(|| dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed"));
     }
     Ok(parse_unix_auto(raw)?
         .with_timezone(&session_offset)
@@ -1075,7 +1171,7 @@ fn parse_timestamptz_fallback(
     if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         let naive = date
             .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| anyhow::anyhow!("dmdb.start_from parse failed"))?;
+            .ok_or_else(|| dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed"))?;
         return bind_naive_to_fixed_offset(naive, session_offset, "dmdb.start_from");
     }
     Ok(parse_unix_auto(raw)?.with_timezone(&session_offset))
@@ -1086,26 +1182,40 @@ fn parse_unix_auto(raw: &str) -> AnyResult<DateTime<Utc>> {
     match raw.len() {
         13 => parse_unix_millis(raw),
         10 => parse_unix_seconds(raw),
-        _ => anyhow::bail!("dmdb.start_from parse failed"),
+        _ => Err(dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed")),
     }
 }
 
 /// 解析秒级 unix 时间戳。
 fn parse_unix_seconds(raw: &str) -> AnyResult<DateTime<Utc>> {
-    let secs = raw
-        .parse::<i64>()
-        .map_err(|err| anyhow::anyhow!("dmdb.start_from parse unix seconds failed: {err}"))?;
-    DateTime::<Utc>::from_timestamp(secs, 0)
-        .ok_or_else(|| anyhow::anyhow!("dmdb.start_from unix seconds out of range"))
+    let secs = raw.parse::<i64>().map_err(|err| {
+        dmdb_err(
+            DmdbReason::Parse,
+            format!("dmdb.start_from parse unix seconds failed: {err}"),
+        )
+    })?;
+    DateTime::<Utc>::from_timestamp(secs, 0).ok_or_else(|| {
+        dmdb_err(
+            DmdbReason::Time,
+            "dmdb.start_from unix seconds out of range",
+        )
+    })
 }
 
 /// 解析毫秒级 unix 时间戳。
 fn parse_unix_millis(raw: &str) -> AnyResult<DateTime<Utc>> {
-    let millis = raw
-        .parse::<i64>()
-        .map_err(|err| anyhow::anyhow!("dmdb.start_from parse unix milliseconds failed: {err}"))?;
-    DateTime::<Utc>::from_timestamp_millis(millis)
-        .ok_or_else(|| anyhow::anyhow!("dmdb.start_from unix milliseconds out of range"))
+    let millis = raw.parse::<i64>().map_err(|err| {
+        dmdb_err(
+            DmdbReason::Parse,
+            format!("dmdb.start_from parse unix milliseconds failed: {err}"),
+        )
+    })?;
+    DateTime::<Utc>::from_timestamp_millis(millis).ok_or_else(|| {
+        dmdb_err(
+            DmdbReason::Time,
+            "dmdb.start_from unix milliseconds out of range",
+        )
+    })
 }
 
 /// 按常见无时区时间格式解析输入。
@@ -1120,10 +1230,12 @@ fn bind_naive_to_fixed_offset(
     offset: FixedOffset,
     field_name: &str,
 ) -> AnyResult<DateTime<FixedOffset>> {
-    offset
-        .from_local_datetime(&naive)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("{field_name} is ambiguous or invalid in fixed timezone"))
+    offset.from_local_datetime(&naive).single().ok_or_else(|| {
+        dmdb_err(
+            DmdbReason::Time,
+            format!("{field_name} is ambiguous or invalid in fixed timezone"),
+        )
+    })
 }
 
 /// 判断格式串是否显式包含时区偏移。

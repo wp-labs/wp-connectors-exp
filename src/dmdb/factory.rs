@@ -1,14 +1,17 @@
 use super::common::connect_shared;
 use super::config::{DmdbConnConf, DmdbSinkConf, DmdbSourceConf};
+use super::error::{DmdbError, DmdbReason, DmdbResult, dmdb_err};
 use super::sink::DmdbSink;
 use super::source::{DmdbSource, validate_source_cursor_type_and_start_from};
 use async_trait::async_trait;
+use orion_error::prelude::SourceErr;
 use serde_json::{Value, json};
 use wp_conf_base::ConfParser;
 use wp_connector_api::{
     ConnectorDef, ConnectorScope, ParamMap, SinkBuildCtx, SinkDefProvider, SinkError, SinkFactory,
-    SinkHandle, SinkReason, SinkResult, SinkSpec, SourceBuildCtx, SourceDefProvider, SourceFactory,
-    SourceHandle, SourceMeta, SourceReason, SourceResult, SourceSpec, SourceSvcIns, Tags,
+    SinkHandle, SinkReason, SinkResult, SinkSpec, SourceBuildCtx, SourceDefProvider, SourceError,
+    SourceFactory, SourceHandle, SourceMeta, SourceReason, SourceResult, SourceSpec, SourceSvcIns,
+    Tags,
 };
 
 use crate::WP_SRC_VAL;
@@ -20,8 +23,6 @@ const DEFAULT_SINK_BATCH_SIZE: usize = 1024;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 8;
 const MIN_POLL_INTERVAL_MS: u64 = 100;
 const MIN_ERROR_BACKOFF_MS: u64 = 200;
-
-type ParseResult<T> = Result<T, String>;
 
 /// 达梦 Source 工厂：负责配置校验、实例化与 connector 定义暴露。
 pub struct DmdbSourceFactory;
@@ -63,7 +64,7 @@ impl SourceFactory for DmdbSourceFactory {
         meta_tags.set(WP_SRC_VAL, "dmdb");
         let source = DmdbSource::new(spec.name.clone(), meta_tags.clone(), &conf)
             .await
-            .map_err(|err| SourceReason::Other(err.to_string()))?;
+            .map_err(dmdb_error_to_source)?;
 
         let mut meta = SourceMeta::new(spec.name.clone(), spec.kind.clone());
         meta.tags = meta_tags;
@@ -92,9 +93,9 @@ impl SinkFactory for DmdbSinkFactory {
         let batch_size = conf.normalized_batch_size();
         let query_timeout_sec = conf.conn.query_timeout_secs;
         let schema = conf.conn.schema.clone();
-        let connection = connect_shared(&conf.conn).await.map_err(|err| {
-            SinkError::from(SinkReason::sink(format!("connect dmdb fail: {err}")))
-        })?;
+        let connection = connect_shared(&conf.conn)
+            .await
+            .map_err(dmdb_error_to_sink)?;
 
         let sink = DmdbSink::new(
             connection,
@@ -217,16 +218,16 @@ fn dmdb_sink_defaults() -> ParamMap {
 
 /// 将 `SourceSpec` 解析为强类型配置，并在构建前完成基础校验。
 fn build_dmdb_source_conf(spec: &SourceSpec) -> SourceResult<DmdbSourceConf> {
-    let conf = build_dmdb_source_conf_from_params(&spec.params).map_err(SourceReason::Other)?;
+    let conf = build_dmdb_source_conf_from_params(&spec.params).map_err(dmdb_error_to_source)?;
     validate_dmdb_source_conf(&conf)?;
     Ok(conf)
 }
 
 fn build_dmdb_sink_conf(spec: &SinkSpec) -> SinkResult<DmdbSinkConf> {
-    Ok(build_dmdb_sink_conf_from_params(&spec.params).map_err(SinkReason::sink)?)
+    build_dmdb_sink_conf_from_params(&spec.params).map_err(dmdb_error_to_sink)
 }
 
-fn build_dmdb_source_conf_from_params(params: &ParamMap) -> ParseResult<DmdbSourceConf> {
+fn build_dmdb_source_conf_from_params(params: &ParamMap) -> DmdbResult<DmdbSourceConf> {
     Ok(DmdbSourceConf {
         conn: build_dmdb_conn_conf_from_params(params)?,
         table: optional_string(params, "table")?,
@@ -240,7 +241,7 @@ fn build_dmdb_source_conf_from_params(params: &ParamMap) -> ParseResult<DmdbSour
     })
 }
 
-fn build_dmdb_sink_conf_from_params(params: &ParamMap) -> ParseResult<DmdbSinkConf> {
+fn build_dmdb_sink_conf_from_params(params: &ParamMap) -> DmdbResult<DmdbSinkConf> {
     Ok(DmdbSinkConf {
         conn: build_dmdb_conn_conf_from_params(params)?,
         table: optional_string(params, "table")?,
@@ -249,7 +250,7 @@ fn build_dmdb_sink_conf_from_params(params: &ParamMap) -> ParseResult<DmdbSinkCo
 }
 
 /// 先解析连接模式，再回填为统一的 `DmdbConnConf`，便于运行时代码复用。
-fn build_dmdb_conn_conf_from_params(params: &ParamMap) -> ParseResult<DmdbConnConf> {
+fn build_dmdb_conn_conf_from_params(params: &ParamMap) -> DmdbResult<DmdbConnConf> {
     let connection_mode = parse_connection_mode(params)?;
 
     let (connection_string, endpoint, dsn, driver, username, password) = match connection_mode {
@@ -298,18 +299,17 @@ fn build_dmdb_conn_conf_from_params(params: &ParamMap) -> ParseResult<DmdbConnCo
 
 /// Source 校验除了必填字段外，还会确认游标类型与 `start_from` 组合是否合法。
 fn validate_dmdb_source_conf(conf: &DmdbSourceConf) -> SourceResult<()> {
-    validate_connection_mode_from_conf(&conf.conn)
-        .map_err(|err| SourceReason::Other(err.to_string()))?;
+    validate_connection_mode_from_conf(&conf.conn).map_err(dmdb_error_to_source)?;
 
     require_present_field(
         conf.table.as_deref(),
         "dmdb.table must not be empty",
-        SourceReason::Other,
+        SourceReason::other,
     )?;
     require_present_field(
         conf.cursor_column.as_deref(),
         "dmdb.cursor_column must not be empty",
-        SourceReason::Other,
+        SourceReason::other,
     )?;
 
     let cursor_type = conf
@@ -323,31 +323,31 @@ fn validate_dmdb_source_conf(conf: &DmdbSourceConf) -> SourceResult<()> {
         conf.batch,
         DEFAULT_SOURCE_BATCH,
         "dmdb.batch must be > 0",
-        SourceReason::Other,
+        SourceReason::other,
     )?;
     validate_min_u64(
         conf.poll_interval_ms,
         DEFAULT_SOURCE_POLL_INTERVAL_MS,
         MIN_POLL_INTERVAL_MS,
         "dmdb.poll_interval_ms must be >= 100",
-        SourceReason::Other,
+        SourceReason::other,
     )?;
     validate_min_u64(
         conf.error_backoff_ms,
         DEFAULT_SOURCE_ERROR_BACKOFF_MS,
         MIN_ERROR_BACKOFF_MS,
         "dmdb.error_backoff_ms must be >= 200",
-        SourceReason::Other,
+        SourceReason::other,
     )?;
     validate_optional_positive_u64(
         conf.conn.connect_timeout_secs,
         "dmdb.connect_timeout_secs must be > 0",
-        SourceReason::Other,
+        SourceReason::other,
     )?;
     validate_optional_positive_usize(
         conf.conn.query_timeout_secs,
         "dmdb.query_timeout_secs must be > 0",
-        SourceReason::Other,
+        SourceReason::other,
     )?;
 
     validate_source_cursor_type_and_start_from(
@@ -355,15 +355,14 @@ fn validate_dmdb_source_conf(conf: &DmdbSourceConf) -> SourceResult<()> {
         conf.start_from.as_deref(),
         conf.start_from_format.as_deref(),
     )
-    .map_err(|err| SourceReason::Other(err.to_string()))?;
+    .map_err(dmdb_error_to_source)?;
 
     Ok(())
 }
 
 fn validate_dmdb_sink_spec(spec: &SinkSpec) -> SinkResult<()> {
     let conf = build_dmdb_sink_conf(spec)?;
-    validate_connection_mode_from_conf(&conf.conn)
-        .map_err(|err| SinkReason::sink(err.to_string()))?;
+    validate_connection_mode_from_conf(&conf.conn).map_err(dmdb_error_to_sink)?;
 
     require_present_field(
         conf.table.as_deref(),
@@ -373,7 +372,7 @@ fn validate_dmdb_sink_spec(spec: &SinkSpec) -> SinkResult<()> {
 
     let columns = sink_columns_from_spec(spec)?;
     if columns.is_empty() {
-        return Err(SinkReason::sink("dmdb.columns must not be empty").into());
+        return Err(SinkReason::sink("dmdb.columns must not be empty"));
     }
 
     validate_optional_positive_usize(
@@ -398,7 +397,7 @@ fn validate_dmdb_sink_spec(spec: &SinkSpec) -> SinkResult<()> {
 // ===== 连接参数解析 =====
 
 /// 按 `connection_string` > `endpoint` > `dsn` 的优先级解析连接方式。
-fn parse_connection_mode(params: &ParamMap) -> ParseResult<DmdbConnectionMode> {
+fn parse_connection_mode(params: &ParamMap) -> DmdbResult<DmdbConnectionMode> {
     let connection_string = optional_string(params, "connection_string")?;
     let dsn = optional_string(params, "dsn")?;
     let endpoint = optional_string(params, "endpoint")?;
@@ -451,70 +450,97 @@ fn parse_connection_mode(params: &ParamMap) -> ParseResult<DmdbConnectionMode> {
         });
     }
 
-    Err("dmdb.connection_string, dmdb.endpoint or dmdb.dsn must provide at least one".into())
+    Err(dmdb_err(
+        DmdbReason::Config,
+        "dmdb.connection_string, dmdb.endpoint or dmdb.dsn must provide at least one",
+    ))
 }
 
 /// 对已解析配置做二次校验，确保运行时能无歧义地选择连接方式。
-fn validate_connection_mode_from_conf(conf: &DmdbConnConf) -> anyhow::Result<()> {
+fn validate_connection_mode_from_conf(conf: &DmdbConnConf) -> DmdbResult<()> {
     if has_text(conf.connection_string.as_deref()) {
         return Ok(());
     }
 
     if has_text(Some(conf.endpoint.as_str())) {
         if conf.driver.trim().is_empty() {
-            anyhow::bail!("dmdb.driver must not be empty when using endpoint connection");
+            return Err(dmdb_err(
+                DmdbReason::Config,
+                "dmdb.driver must not be empty when using endpoint connection",
+            ));
         }
         if conf.username.trim().is_empty() {
-            anyhow::bail!("dmdb.username must not be empty when using endpoint or dsn connection");
+            return Err(dmdb_err(
+                DmdbReason::Config,
+                "dmdb.username must not be empty when using endpoint or dsn connection",
+            ));
         }
         if conf.password.is_empty() {
-            anyhow::bail!("dmdb.password must not be empty when using endpoint or dsn connection");
+            return Err(dmdb_err(
+                DmdbReason::Config,
+                "dmdb.password must not be empty when using endpoint or dsn connection",
+            ));
         }
         return Ok(());
     }
 
     if has_text(conf.dsn.as_deref()) {
         if conf.username.trim().is_empty() {
-            anyhow::bail!("dmdb.username must not be empty when using endpoint or dsn connection");
+            return Err(dmdb_err(
+                DmdbReason::Config,
+                "dmdb.username must not be empty when using endpoint or dsn connection",
+            ));
         }
         if conf.password.is_empty() {
-            anyhow::bail!("dmdb.password must not be empty when using endpoint or dsn connection");
+            return Err(dmdb_err(
+                DmdbReason::Config,
+                "dmdb.password must not be empty when using endpoint or dsn connection",
+            ));
         }
         return Ok(());
     }
 
-    anyhow::bail!("dmdb.connection_string, dmdb.endpoint or dmdb.dsn must provide at least one")
+    Err(dmdb_err(
+        DmdbReason::Config,
+        "dmdb.connection_string, dmdb.endpoint or dmdb.dsn must provide at least one",
+    ))
 }
 
 // ===== 参数读取与通用校验 =====
 
 /// Sink 的列顺序来自上游配置，这里只做结构化解析，不尝试反查数据库元数据。
 fn sink_columns_from_spec(spec: &SinkSpec) -> SinkResult<Vec<String>> {
-    Ok(parse_columns(&spec.params).map_err(SinkReason::sink)?)
+    parse_columns(&spec.params).map_err(dmdb_error_to_sink)
 }
 
-fn parse_columns(params: &ParamMap) -> ParseResult<Vec<String>> {
+fn parse_columns(params: &ParamMap) -> DmdbResult<Vec<String>> {
     match params.get("columns") {
         None => Ok(Vec::new()),
         Some(Value::Array(arr)) => arr
             .iter()
             .map(|item| {
-                let value = item
-                    .as_str()
-                    .ok_or_else(|| "dmdb.columns entries must be string".to_string())?;
+                let value = item.as_str().ok_or_else(|| {
+                    dmdb_err(DmdbReason::Config, "dmdb.columns entries must be string")
+                })?;
                 let trimmed = value.trim();
                 if trimmed.is_empty() {
-                    return Err("dmdb.columns entries must not be empty".to_string());
+                    return Err(dmdb_err(
+                        DmdbReason::Config,
+                        "dmdb.columns entries must not be empty",
+                    ));
                 }
                 Ok(trimmed.to_string())
             })
             .collect(),
-        Some(_) => Err("dmdb.columns must be an array".into()),
+        Some(_) => Err(dmdb_err(
+            DmdbReason::Config,
+            "dmdb.columns must be an array",
+        )),
     }
 }
 
 /// 统一将空字符串视为“未配置”，减少调用端重复 trim/判空。
-fn optional_string(params: &ParamMap, key: &str) -> ParseResult<Option<String>> {
+fn optional_string(params: &ParamMap, key: &str) -> DmdbResult<Option<String>> {
     match params.get(key) {
         None => Ok(None),
         Some(Value::String(value)) => {
@@ -525,34 +551,64 @@ fn optional_string(params: &ParamMap, key: &str) -> ParseResult<Option<String>> 
                 Ok(Some(trimmed.to_string()))
             }
         }
-        Some(_) => Err(format!("dmdb.{key} must be a string")),
+        Some(_) => Err(dmdb_err(
+            DmdbReason::Config,
+            format!("dmdb.{key} must be a string"),
+        )),
     }
 }
 
-fn require_non_empty_string(params: &ParamMap, key: &str, message: &str) -> ParseResult<String> {
-    optional_string(params, key)?.ok_or_else(|| message.to_string())
+fn require_non_empty_string(params: &ParamMap, key: &str, message: &str) -> DmdbResult<String> {
+    optional_string(params, key)?.ok_or_else(|| dmdb_err(DmdbReason::Config, message))
 }
 
-fn optional_usize(params: &ParamMap, key: &str) -> ParseResult<Option<usize>> {
+fn optional_usize(params: &ParamMap, key: &str) -> DmdbResult<Option<usize>> {
     match params.get(key) {
         None => Ok(None),
         Some(Value::Number(number)) => number
             .as_u64()
             .map(|value| Some(value as usize))
-            .ok_or_else(|| format!("dmdb.{key} must be a non-negative integer")),
-        Some(_) => Err(format!("dmdb.{key} must be an integer")),
+            .ok_or_else(|| {
+                dmdb_err(
+                    DmdbReason::Config,
+                    format!("dmdb.{key} must be a non-negative integer"),
+                )
+            }),
+        Some(_) => Err(dmdb_err(
+            DmdbReason::Config,
+            format!("dmdb.{key} must be an integer"),
+        )),
     }
 }
 
-fn optional_u64(params: &ParamMap, key: &str) -> ParseResult<Option<u64>> {
+fn optional_u64(params: &ParamMap, key: &str) -> DmdbResult<Option<u64>> {
     match params.get(key) {
         None => Ok(None),
-        Some(Value::Number(number)) => number
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| format!("dmdb.{key} must be a non-negative integer")),
-        Some(_) => Err(format!("dmdb.{key} must be an integer")),
+        Some(Value::Number(number)) => number.as_u64().map(Some).ok_or_else(|| {
+            dmdb_err(
+                DmdbReason::Config,
+                format!("dmdb.{key} must be a non-negative integer"),
+            )
+        }),
+        Some(_) => Err(dmdb_err(
+            DmdbReason::Config,
+            format!("dmdb.{key} must be an integer"),
+        )),
     }
+}
+
+fn dmdb_error_to_source(err: DmdbError) -> SourceError {
+    let detail = err.to_string();
+    Err::<(), _>(err)
+        .source_err(SourceReason::Other, detail)
+        .expect_err("mapping dmdb source error should fail")
+}
+
+fn dmdb_error_to_sink(err: DmdbError) -> SinkError {
+    let detail = err.to_string();
+    Err::<(), _>(err)
+        .source_err(SinkReason::Sink, detail)
+        .expect_err("mapping dmdb sink error should fail")
 }
 
 fn has_text(value: Option<&str>) -> bool {

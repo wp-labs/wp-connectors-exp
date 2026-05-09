@@ -1,9 +1,8 @@
 use super::common::{DmdbConnectionHandle, connect_shared, escape_sql_literal, quote_identifier};
 use super::config::DmdbSinkConf;
-use super::error::{DmdbError, DmdbReason, DmdbResult, dmdb_err};
+use super::source::{DmdbReason, DmdbResult, dmdb_err};
 use async_trait::async_trait;
 use odbc_api::Connection;
-use orion_error::prelude::{SourceErr, SourceRawErr};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
@@ -137,7 +136,7 @@ impl AsyncCtrl for DmdbSink {
     async fn reconnect(&mut self) -> SinkResult<()> {
         let connection = connect_shared(&self.config.conn)
             .await
-            .source_err(SinkReason::Sink, "reconnect dmdb fail")?;
+            .map_err(|err| SinkReason::sink(format!("reconnect dmdb fail: {err}")))?;
         self.connection = Some(connection);
         Ok(())
     }
@@ -176,7 +175,9 @@ impl AsyncRecordSink for DmdbSink {
             execute_statements_in_transaction(connection, statements, query_timeout_secs)
         })
         .await
-        .source_raw_err(SinkReason::Sink, "spawn dmdb transaction exec task failed")?;
+        .map_err(|err| {
+            SinkReason::sink(format!("spawn dmdb transaction exec task failed: {err}"))
+        })?;
 
         if let Err(err) = result {
             error_data!(
@@ -185,15 +186,10 @@ impl AsyncRecordSink for DmdbSink {
                 err,
                 statements_for_log
             );
-            return Err(Err::<(), _>(err)
-                .source_err(
-                    SinkReason::Sink,
-                    format!(
-                        "dmdb exec transaction columns:{:?}, sqls: {:?}",
-                        columns, statements_for_log
-                    ),
-                )
-                .expect_err("mapping dmdb transaction error should fail"));
+            return Err(SinkReason::sink(format!(
+                "dmdb exec transaction columns:{:?}, fail: {}, sqls: {:?}",
+                columns, err, statements_for_log
+            )));
         }
 
         Ok(())
@@ -230,12 +226,17 @@ fn execute_statements_in_transaction(
 
     let conn_guard = connection
         .lock()
-        .map_err(|_| dmdb_err(DmdbReason::Lock, "lock dmdb connection fail"))?;
+        .map_err(|_| dmdb_err(DmdbReason::Database, "lock dmdb connection fail"))?;
 
     // 整次 sink_records 共用一个事务，避免前半批成功、后半批失败后留下部分写入。
     conn_guard
         .set_autocommit(false)
-        .source_raw_err(DmdbReason::Transaction, "set dmdb autocommit=false fail")?;
+        .map_err(|err| {
+            dmdb_err(
+                DmdbReason::Database,
+                format!("set dmdb autocommit=false fail: {err}"),
+            )
+        })?;
 
     let result = (|| -> DmdbResult<()> {
         for statement in &statements {
@@ -252,7 +253,12 @@ fn execute_statements_in_transaction(
 
         conn_guard
             .commit()
-            .source_raw_err(DmdbReason::Transaction, "commit dmdb transaction fail")?;
+            .map_err(|err| {
+                dmdb_err(
+                    DmdbReason::Database,
+                    format!("commit dmdb transaction fail: {err}"),
+                )
+            })?;
 
         Ok(())
     })();
@@ -271,29 +277,29 @@ fn execute_statements_in_transaction(
 /// 回滚事务并恢复自动提交模式。
 /// 如果 rollback 自身失败，则保留 autocommit=false，避免在未知事务状态下继续提交。
 fn rollback_and_restore_autocommit(
-    err: DmdbError,
+    err: super::source::DmdbError,
     connection: &Connection<'static>,
 ) -> DmdbResult<()> {
     connection.rollback().map_err(|rollback_err| {
         dmdb_err(
-            DmdbReason::Transaction,
+            DmdbReason::Database,
             format!(
-            "{err}; rollback dmdb transaction also failed: {rollback_err}; autocommit is not restored to avoid committing an uncertain transaction"
+                "{err}; rollback dmdb transaction also failed: {rollback_err}; autocommit is not restored to avoid committing an uncertain transaction"
             ),
         )
     })?;
 
     connection.set_autocommit(true).map_err(|autocommit_err| {
         dmdb_err(
-            DmdbReason::Transaction,
+            DmdbReason::Database,
             format!(
-            "{err}; dmdb transaction has been rolled back, but restore autocommit failed: {autocommit_err}"
+                "{err}; dmdb transaction has been rolled back, but restore autocommit failed: {autocommit_err}"
             ),
         )
     })?;
 
     Err(dmdb_err(
-        DmdbReason::Transaction,
+        DmdbReason::Database,
         format!("{err}; dmdb transaction has been rolled back"),
     ))
 }

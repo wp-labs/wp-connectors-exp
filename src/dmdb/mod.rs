@@ -9,7 +9,6 @@
 
 mod common;
 mod config;
-mod error;
 mod factory;
 mod sink;
 mod source;

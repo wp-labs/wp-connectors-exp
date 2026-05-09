@@ -1,4 +1,4 @@
-use super::error::{DmdbReason, DmdbResult, dmdb_err};
+use super::source::{DmdbReason, DmdbResult, dmdb_err};
 use educe::Educe;
 use odbc_api::{ConnectionOptions, escape_attribute_value};
 use serde::{Deserialize, Serialize};
@@ -82,12 +82,14 @@ impl DmdbConnConf {
             ));
         }
 
-        let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
-            dmdb_err(
-                DmdbReason::Config,
-                "dmdb.endpoint must be in host:port format",
-            )
-        })?;
+        let (host, port) = endpoint
+            .rsplit_once(':')
+            .ok_or_else(|| {
+                dmdb_err(
+                    DmdbReason::Config,
+                    "dmdb.endpoint must be in host:port format",
+                )
+            })?;
 
         if host.trim().is_empty() {
             return Err(dmdb_err(
@@ -96,12 +98,14 @@ impl DmdbConnConf {
             ));
         }
 
-        let port = port.parse::<u16>().map_err(|err| {
-            dmdb_err(
-                DmdbReason::Config,
-                format!("dmdb.endpoint port must be a valid u16 integer: {err}"),
-            )
-        })?;
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| {
+                dmdb_err(
+                    DmdbReason::Config,
+                    "dmdb.endpoint port must be a valid u16 integer",
+                )
+            })?;
 
         Ok((host, port))
     }

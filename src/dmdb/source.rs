@@ -2,36 +2,75 @@ use super::common::{
     DmdbConnectionHandle, connect_shared_blocking, escape_sql_literal, quote_identifier,
 };
 use super::config::DmdbSourceConf;
-use super::error::{DmdbReason, DmdbResult, dmdb_err};
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use odbc_api::sys::SqlDataType;
 use odbc_api::{Cursor, DataType};
-use orion_error::prelude::{SourceErr, SourceRawErr};
+use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
+use orion_error::{OrionError, StructError, UnifiedReason};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{self, Receiver as TokioReceiver, Sender as TokioSender};
 use tokio::task;
-use tokio::time::sleep;
-use wp_connector_api::{DataSource, SourceBatch, SourceEvent, SourceReason, SourceResult, Tags};
-use wp_log::{info_data, warn_data};
+use wp_connector_api::{
+    CtrlRx, DataSource, SourceBatch, SourceEvent, SourceReason, SourceResult, Tags,
+};
+use wp_log::{debug_ctrl, info_ctrl, info_data, warn_ctrl, warn_data};
 use wp_model_core::event_id::next_wp_event_id;
 use wp_model_core::raw::RawData;
 
-type AnyResult<T> = DmdbResult<T>;
+pub(crate) type DmdbError = StructError<DmdbReason>;
+pub(crate) type DmdbResult<T> = Result<T, DmdbError>;
 
-const DEFAULT_BATCH: usize = 512;
+#[derive(Debug, Clone, PartialEq, Serialize, OrionError)]
+pub(crate) enum DmdbReason {
+    #[orion_error(identity = "conf.dmdb_config", message = "dmdb config error")]
+    Config,
+    #[orion_error(identity = "logic.dmdb_cursor", message = "dmdb cursor error")]
+    Cursor,
+    #[orion_error(identity = "logic.dmdb_checkpoint", message = "dmdb checkpoint error")]
+    Checkpoint,
+    #[orion_error(identity = "logic.dmdb_time", message = "dmdb time error")]
+    Time,
+    #[orion_error(identity = "conf.dmdb_parse", message = "dmdb parse error")]
+    Parse,
+    #[orion_error(identity = "sys.dmdb_database", message = "dmdb database error")]
+    Database,
+    #[orion_error(identity = "sys.dmdb_io", message = "dmdb io error")]
+    Io,
+    #[orion_error(transparent)]
+    #[allow(dead_code)]
+    Uvs(UnifiedReason),
+}
+
+pub(crate) fn dmdb_err(reason: DmdbReason, detail: impl Into<String>) -> DmdbError {
+    reason.to_err().with_detail(detail)
+}
+
+const DEFAULT_BATCH: usize = 2048;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_ERROR_BACKOFF_MS: u64 = 2000;
 const CHECKPOINT_VERSION: u32 = 1;
+/// `CursorRow::get_text` 遇到空缓冲时只会先申请 256B，达梦 ODBC 在分段返回较长文本时会为每次首段读取输出 `01004/String truncate` 告警。
+/// 这里预留一个足够覆盖常见游标文本的容量。
+const INITIAL_CURSOR_BUF_CAPACITY: usize = 128;
+/// payload 是整行 JSON，常见场景明显超过 256B；直接给较大的初始容量，并在逐行读取时复用，
+const INITIAL_PAYLOAD_BUF_CAPACITY: usize = 64 * 1024;
+/// 预取队列按“批次”限流，避免后台无限预取导致内存膨胀。
+const PREFETCH_QUEUE_CAPACITY: usize = 8;
 
-/// 达梦增量 Source。
 /// 运行时会维护本地 checkpoint，以便重启后从上次成功消费位置继续拉取。
 pub struct DmdbSource {
     /// Source 唯一标识，同时用于 checkpoint 文件命名。
     key: String,
     /// 当前 Source 自己持有的 ODBC 连接句柄，所有查询都在阻塞线程中串行执行。
-    connection: Option<DmdbConnectionHandle>,
+    connection: DmdbConnectionHandle,
     /// 带 schema 的表引用，直接参与 SQL 拼装。
     table_ref: String,
     /// 原始表名，用于回填到 payload 元数据。
@@ -56,6 +95,38 @@ pub struct DmdbSource {
     query_timeout_secs: Option<usize>,
     /// 透传给下游事件的标签。
     tags: Tags,
+    /// 后台预取线程写入的有界批次队列。
+    batch_rx: Option<TokioReceiver<PreparedBatch>>,
+    /// 当前 worker 的停止标记；仅在 worker 存活期间存在。
+    worker_stop: Option<Arc<AtomicBool>>,
+    /// worker 线程句柄。close 时仅发送 stop 并释放句柄，不在 async 上下文阻塞 join。
+    worker_handle: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct PreparedBatch {
+    events: SourceBatch,
+    last_cursor_raw: String,
+    round: u64,
+    lower_bound: Option<String>,
+}
+
+struct PrefetchWorker {
+    key: String,
+    connection: DmdbConnectionHandle,
+    table_ref: String,
+    table_name: String,
+    cursor_column: String,
+    cursor_plan: CursorPlan,
+    tags: Tags,
+    batch_size: usize,
+    poll_interval: Duration,
+    error_backoff: Duration,
+    query_timeout_secs: Option<usize>,
+    stop_flag: Arc<AtomicBool>,
+    batch_tx: TokioSender<PreparedBatch>,
+    query_round: u64,
+    current_lower_bound: Option<String>,
 }
 
 impl DmdbSource {
@@ -65,7 +136,7 @@ impl DmdbSource {
     }
 
     /// 根据配置建立达梦增量 Source，并在启动阶段完成游标计划探测。
-    pub(crate) async fn new(key: String, tags: Tags, config: &DmdbSourceConf) -> AnyResult<Self> {
+    pub async fn new(key: String, tags: Tags, config: &DmdbSourceConf) -> SourceResult<Self> {
         let table = required_opt_field("dmdb.table", &config.table)?;
         let cursor_column = required_opt_field("dmdb.cursor_column", &config.cursor_column)?;
         let cursor_type = CursorType::from_config(
@@ -75,14 +146,19 @@ impl DmdbSource {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("int"),
-        )?;
+        )
+        .source_err(SourceReason::Other, "initialize dmdb source failed")?;
 
         // 建连走阻塞线程，避免 ODBC 调用卡住 Tokio runtime。
         let connection = {
             let conf = config.conn.clone();
             task::spawn_blocking(move || connect_shared_blocking(&conf))
                 .await
-                .source_raw_err(DmdbReason::Runtime, "spawn dmdb source connect task failed")??
+                .source_raw_err(
+                    SourceReason::Other,
+                    "initialize dmdb source failed: spawn connect task failed",
+                )?
+                .source_err(SourceReason::Other, "initialize dmdb source failed")?
         };
 
         let schema = normalized_schema(config.conn.schema.as_deref());
@@ -103,22 +179,25 @@ impl DmdbSource {
             })
             .await
             .source_raw_err(
-                DmdbReason::Runtime,
-                "spawn dmdb source cursor plan task failed",
-            )??
+                SourceReason::Other,
+                "initialize dmdb source failed: spawn cursor plan task failed",
+            )?
+            .source_err(SourceReason::Other, "initialize dmdb source failed")?
         };
 
         let start_from_format =
-            parse_start_from_format(config.start_from_format.as_deref(), cursor_type)?;
+            parse_start_from_format(config.start_from_format.as_deref(), cursor_type)
+                .source_err(SourceReason::Other, "initialize dmdb source failed")?;
         let session_offset = FixedOffset::east_opt(0)
-            .ok_or_else(|| dmdb_err(DmdbReason::Time, "build UTC fixed offset failed"))?;
+            .ok_or_else(|| SourceReason::other("build UTC fixed offset failed"))?;
         // `start_from` 会先标准化为数据库可稳定比较的文本形式。
         let start_from = normalize_optional_start_from(
             &cursor_plan,
             config.start_from.as_deref(),
             start_from_format.as_ref(),
             session_offset,
-        )?;
+        )
+        .source_err(SourceReason::Other, "initialize dmdb source failed")?;
 
         let batch = config.batch.unwrap_or(DEFAULT_BATCH).max(1);
         let poll_interval =
@@ -128,10 +207,13 @@ impl DmdbSource {
 
         let table_ref = qualified_table_name(schema.as_deref(), table);
         let checkpoint_path = checkpoint_path(&key);
-        let checkpoint = Self::load_checkpoint(&checkpoint_path, cursor_column, &cursor_plan)?;
+        let checkpoint = Self::load_checkpoint(&checkpoint_path, cursor_column, &cursor_plan)
+            .source_err(SourceReason::Other, "initialize dmdb source failed")?;
         // checkpoint 优先于 start_from，避免 Source 重启后重复回到初始位点。
         if let Some(lower_bound) = resolve_lower_bound(checkpoint.as_ref(), start_from.as_deref()) {
-            cursor_plan.validate_lower_bound(lower_bound, "dmdb active lower bound")?;
+            cursor_plan
+                .validate_lower_bound(lower_bound, "dmdb active lower bound")
+                .source_err(SourceReason::Other, "initialize dmdb source failed")?;
         }
 
         info_data!(
@@ -143,7 +225,7 @@ impl DmdbSource {
 
         Ok(Self {
             key,
-            connection: Some(connection),
+            connection,
             table_ref,
             table_name: table.to_string(),
             cursor_column: cursor_column.to_string(),
@@ -156,66 +238,85 @@ impl DmdbSource {
             start_from,
             query_timeout_secs: config.conn.query_timeout_secs,
             tags,
+            batch_rx: None,
+            worker_stop: None,
+            worker_handle: None,
         })
+    }
+
+    fn ensure_worker_started(&mut self) -> SourceResult<()> {
+        if self.batch_rx.is_some() {
+            return Ok(());
+        }
+        let connection = self.connection.clone();
+        let (batch_tx, batch_rx) = mpsc::channel(PREFETCH_QUEUE_CAPACITY);
+        let key = self.key.clone();
+        let table_ref = self.table_ref.clone();
+        let table_name = self.table_name.clone();
+        let cursor_column = self.cursor_column.clone();
+        let cursor_plan = self.cursor_plan.clone();
+        let tags = self.tags.clone();
+        let batch_size = self.batch;
+        let poll_interval = self.poll_interval;
+        let error_backoff = self.error_backoff;
+        let query_timeout_secs = self.query_timeout_secs;
+        let start_lower_bound = self.lower_bound_raw().map(str::to_string);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        self.worker_stop = Some(Arc::clone(&stop_flag));
+        let handle = thread::Builder::new()
+            .name(format!("dmdb-source-worker-{key}"))
+            .spawn(move || {
+                PrefetchWorker {
+                    key,
+                    connection,
+                    table_ref,
+                    table_name,
+                    cursor_column,
+                    cursor_plan,
+                    tags,
+                    batch_size,
+                    poll_interval,
+                    error_backoff,
+                    query_timeout_secs,
+                    stop_flag,
+                    batch_tx,
+                    query_round: 0,
+                    current_lower_bound: start_lower_bound,
+                }
+                .run()
+            })
+            .map_err(|err| {
+                SourceReason::other(format!("spawn dmdb source worker failed: {err}"))
+            })?;
+        self.batch_rx = Some(batch_rx);
+        self.worker_handle = Some(handle);
+        info_ctrl!(
+            "[dmdb-source] {} prefetch worker started (queue_cap={})",
+            self.key,
+            PREFETCH_QUEUE_CAPACITY
+        );
+        Ok(())
     }
 
     /// 主轮询循环：查询一批数据、组装事件，并在成功后推进 checkpoint。
     async fn recv_impl(&mut self) -> SourceResult<SourceBatch> {
-        loop {
-            let rows = match self.query_next_batch().await {
-                Ok(rows) => rows,
-                Err(err) => {
-                    warn_data!(
-                        "[dmdb-source] query failed, backing off {:?}: {}",
-                        self.error_backoff,
-                        err
-                    );
-                    sleep(self.error_backoff).await;
-                    continue;
-                }
-            };
-
-            if rows.is_empty() {
-                // 没有新数据不算错误，按轮询间隔继续等待。
-                sleep(self.poll_interval).await;
-                continue;
-            }
-
-            let mut batch = Vec::with_capacity(rows.len());
-            let mut last_cursor_raw = None;
-            for (cursor_raw, payload) in rows {
-                batch.push(SourceEvent::new(
-                    next_wp_event_id(),
-                    self.key.clone(),
-                    RawData::from_string(payload),
-                    self.tags.clone().into(),
-                ));
-                last_cursor_raw = Some(cursor_raw);
-            }
-
-            if let Some(last_cursor_raw) = last_cursor_raw {
-                self.persist_checkpoint(last_cursor_raw)?;
-            }
-            return Ok(batch);
-        }
-    }
-
-    /// 在阻塞线程中执行一轮批量查询，避免 ODBC 调用阻塞异步 runtime。
-    async fn query_next_batch(&self) -> SourceResult<Vec<(String, String)>> {
-        let connection = self
-            .connection
-            .clone()
-            .ok_or_else(|| SourceReason::other("dmdb source connection is not initialized"))?;
-        let lower_bound = self.lower_bound_raw().map(std::string::ToString::to_string);
-        let query_timeout_secs = self.query_timeout_secs;
-        let sql = self.build_batch_query();
-
-        task::spawn_blocking(move || {
-            query_next_batch_blocking(connection, sql, lower_bound, query_timeout_secs)
-        })
-        .await
-        .source_raw_err(SourceReason::Other, "spawn dmdb source query task failed")?
-        .source_err(SourceReason::SupplierError, "dmdb query batch failed")
+        self.ensure_worker_started()?;
+        let batch_rx = self
+            .batch_rx
+            .as_mut()
+            .ok_or_else(|| SourceReason::other("dmdb source batch receiver is not initialized"))?;
+        let prepared = batch_rx
+            .recv()
+            .await
+            .ok_or_else(|| SourceReason::supplier_error("dmdb prefetch worker channel closed"))?;
+        debug_ctrl!(
+            "[dmdb-source] round={} checkpoint advance from {:?} to {}",
+            prepared.round,
+            prepared.lower_bound.as_deref(),
+            prepared.last_cursor_raw
+        );
+        self.persist_checkpoint(prepared.last_cursor_raw)?;
+        Ok(prepared.events)
     }
 
     /// 获取本轮查询应使用的 lower bound，优先使用 checkpoint 中的最新游标。
@@ -223,51 +324,40 @@ impl DmdbSource {
         resolve_lower_bound(self.checkpoint.as_ref(), self.start_from.as_deref())
     }
 
-    /// 基于当前配置和 lower bound 生成增量拉取 SQL。
-    fn build_batch_query(&self) -> String {
-        build_batch_query(
-            &self.table_ref,
-            &self.table_name,
-            &self.cursor_column,
-            self.lower_bound_raw(),
-            self.batch,
-            &self.cursor_plan,
-        )
-    }
-
     /// 加载并校验本地 checkpoint；不存在时自动创建目录并视为首次启动。
     fn load_checkpoint(
         path: &Path,
         cursor_column: &str,
         cursor_plan: &CursorPlan,
-    ) -> AnyResult<Option<CheckpointState>> {
+    ) -> DmdbResult<Option<CheckpointState>> {
         if !path.exists() {
             ensure_checkpoint_dir(path)?;
             return Ok(None);
         }
 
-        let contents = std::fs::read_to_string(path)
-            .source_err(DmdbReason::Io, "read dmdb checkpoint failed")?;
+        let contents = std::fs::read_to_string(path).source_err(
+            DmdbReason::Io,
+            format!("dmdb read checkpoint {} failed", path.display()),
+        )?;
         if contents.trim().is_empty() {
             return Ok(None);
         }
 
-        let state: CheckpointState = serde_json::from_str(&contents)
-            .source_raw_err(
-                DmdbReason::Checkpoint,
-                format!(
-                    "dmdb checkpoint file {} is invalid; if you changed source cursor config, delete this checkpoint and restart",
-                    path.display()
-                ),
-            )?;
+        let state: CheckpointState = serde_json::from_str(&contents).source_raw_err(
+            DmdbReason::Checkpoint,
+            format!(
+                "dmdb checkpoint file {} is invalid; if you changed source cursor config, delete this checkpoint and restart",
+                path.display()
+            ),
+        )?;
         validate_checkpoint_state(&state, cursor_column, cursor_plan).map_err(|err| {
             dmdb_err(
                 DmdbReason::Checkpoint,
                 format!(
-                "dmdb checkpoint {} is incompatible with current config: {}; if you changed cursor_column/cursor_type or want to restart from a new cursor, delete this checkpoint and restart",
-                path.display(),
-                err
-                )
+                    "dmdb checkpoint {} is incompatible with current config: {}; if you changed cursor_column/cursor_type or want to restart from a new cursor, delete this checkpoint and restart",
+                    path.display(),
+                    err
+                ),
             )
         })?;
         Ok(Some(state))
@@ -275,8 +365,9 @@ impl DmdbSource {
 
     /// 将当前批次最后一条游标持久化到本地 checkpoint 文件。
     fn persist_checkpoint(&mut self, last_cursor_raw: String) -> SourceResult<()> {
-        ensure_checkpoint_dir(&self.checkpoint_path)
-            .source_err(SourceReason::Other, "dmdb ensure checkpoint dir failed")?;
+        ensure_checkpoint_dir(&self.checkpoint_path).map_err(|err| {
+            SourceReason::other(format!("dmdb ensure checkpoint dir failed: {err}"))
+        })?;
 
         // 仅在一批事件成功组装后持久化游标，避免“游标前推但事件未发出”的不一致状态。
         let state = CheckpointState {
@@ -286,11 +377,12 @@ impl DmdbSource {
             last_cursor_raw,
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
-        let content = serde_json::to_string_pretty(&state)
-            .source_raw_err(SourceReason::Other, "dmdb serialize checkpoint failed")?;
+        let content = serde_json::to_vec(&state).map_err(|err| {
+            SourceReason::other(format!("dmdb serialize checkpoint failed: {err}"))
+        })?;
 
         std::fs::write(&self.checkpoint_path, content)
-            .source_err(SourceReason::Other, "dmdb write checkpoint failed")?;
+            .map_err(|err| SourceReason::other(format!("dmdb write checkpoint failed: {err}")))?;
         self.checkpoint = Some(state);
         Ok(())
     }
@@ -309,6 +401,22 @@ impl DataSource for DmdbSource {
     fn identifier(&self) -> String {
         self.key.clone()
     }
+
+    async fn start(&mut self, _ctrl_rx: CtrlRx) -> SourceResult<()> {
+        self.ensure_worker_started()
+    }
+
+    async fn close(&mut self) -> SourceResult<()> {
+        self.batch_rx = None;
+        if let Some(stop_flag) = self.worker_stop.take() {
+            stop_flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(handle) = self.worker_handle.take() {
+            drop(handle);
+        }
+        warn_ctrl!("[dmdb-source] {} prefetch worker stop requested", self.key);
+        Ok(())
+    }
 }
 
 /// 校验 Source 侧游标类型与 `start_from` 相关配置是否匹配。
@@ -316,7 +424,7 @@ pub(crate) fn validate_source_cursor_type_and_start_from(
     raw_cursor_type: &str,
     start_from: Option<&str>,
     start_from_format: Option<&str>,
-) -> AnyResult<()> {
+) -> DmdbResult<()> {
     let cursor_type = CursorType::from_config(raw_cursor_type)?;
     cursor_type.validate_start_from(start_from, start_from_format)?;
     Ok(())
@@ -390,7 +498,7 @@ struct DmdbColumnMeta {
 
 impl CursorType {
     /// 解析配置中的游标类型。
-    fn from_config(raw: &str) -> AnyResult<Self> {
+    fn from_config(raw: &str) -> DmdbResult<Self> {
         match raw {
             "int" => Ok(Self::Int),
             "time" => Ok(Self::Time),
@@ -413,7 +521,7 @@ impl CursorType {
         self,
         start_from: Option<&str>,
         start_from_format: Option<&str>,
-    ) -> AnyResult<()> {
+    ) -> DmdbResult<()> {
         let Some(start_from) = start_from else {
             if start_from_format.is_some() {
                 return Err(dmdb_err(
@@ -427,10 +535,7 @@ impl CursorType {
         if start_from.trim().is_empty() {
             return Err(dmdb_err(
                 DmdbReason::Config,
-                format!(
-                    "dmdb.start_from must not be empty for {} cursor",
-                    self.as_str()
-                ),
+                format!("dmdb.start_from must not be empty for {} cursor", self.as_str()),
             ));
         }
         if start_from_format.is_some() && self != CursorType::Time {
@@ -448,7 +553,7 @@ impl CursorType {
         cursor_column: &str,
         data_type: &DataType,
         type_name: &str,
-    ) -> AnyResult<LowerBoundBinding> {
+    ) -> DmdbResult<LowerBoundBinding> {
         match self {
             Self::Int => {
                 if is_integer_data_type(data_type) {
@@ -489,7 +594,7 @@ impl CursorPlan {
         table: &str,
         cursor_column: &str,
         cursor_type: CursorType,
-    ) -> AnyResult<Self> {
+    ) -> DmdbResult<Self> {
         // 元数据探测在启动时完成，避免运行中才发现类型不匹配。
         let columns = query_table_columns(connection, schema, table)?;
         if columns.is_empty() {
@@ -510,11 +615,12 @@ impl CursorPlan {
                 dmdb_err(
                     DmdbReason::Cursor,
                     format!(
-                        "dmdb source cursor_column not found: {}.{}.{}",
-                        schema.unwrap_or(""),
-                        table,
-                        cursor_column
-                    ),
+                    "dmdb source cursor_column not found: {}.{}.{}",
+                    schema.unwrap_or(""),
+                    table,
+                    cursor_column
+                )
+                    ,
                 )
             })?;
 
@@ -523,7 +629,7 @@ impl CursorPlan {
             &cursor_meta.data_type,
             &cursor_meta.type_name,
         )?;
-        let payload_expr = build_payload_expr(&columns, cursor_column)?;
+        let payload_expr = build_payload_expr(&columns)?;
 
         Ok(Self {
             cursor_type,
@@ -533,7 +639,7 @@ impl CursorPlan {
     }
 
     /// 将 lower bound 文本转换为适配达梦 SQL 的字面量表达式。
-    fn lower_bound_sql_literal(&self, raw: &str) -> AnyResult<String> {
+    fn lower_bound_sql_literal(&self, raw: &str) -> DmdbResult<String> {
         self.validate_lower_bound(raw, "dmdb lower bound")?;
         match self.lower_bound_binding {
             LowerBoundBinding::Integer | LowerBoundBinding::Numeric => Ok(raw.to_string()),
@@ -553,29 +659,30 @@ impl CursorPlan {
     }
 
     /// 校验 lower bound 文本能否被当前游标策略接受。
-    fn validate_lower_bound(&self, raw: &str, field_name: &str) -> AnyResult<()> {
+    fn validate_lower_bound(&self, raw: &str, field_name: &str) -> DmdbResult<()> {
         if raw.trim().is_empty() {
             return Err(dmdb_err(
-                DmdbReason::Cursor,
+                DmdbReason::Parse,
                 format!("{field_name} must not be empty"),
             ));
         }
         match self.lower_bound_binding {
             LowerBoundBinding::Integer => {
-                raw.parse::<i64>().map(|_| ()).map_err(|err| {
-                    dmdb_err(
-                        DmdbReason::Cursor,
-                        format!("{field_name} must be an integer: {err}"),
-                    )
-                })?;
+                raw.parse::<i64>()
+                    .map(|_| ())
+                    .map_err(|err| {
+                        dmdb_err(DmdbReason::Parse, format!("{field_name} must be an integer: {err}"))
+                    })?;
             }
             LowerBoundBinding::Numeric => {
-                raw.parse::<f64>().map(|_| ()).map_err(|err| {
-                    dmdb_err(
-                        DmdbReason::Cursor,
-                        format!("{field_name} must be numeric-like: {err}"),
-                    )
-                })?;
+                raw.parse::<f64>()
+                    .map(|_| ())
+                    .map_err(|err| {
+                        dmdb_err(
+                            DmdbReason::Parse,
+                            format!("{field_name} must be numeric-like: {err}"),
+                        )
+                    })?;
             }
             LowerBoundBinding::Date
             | LowerBoundBinding::Timestamp
@@ -590,7 +697,7 @@ impl CursorPlan {
         raw: &str,
         format: Option<&StartFromFormat>,
         session_offset: FixedOffset,
-    ) -> AnyResult<String> {
+    ) -> DmdbResult<String> {
         self.validate_lower_bound(raw, "dmdb.start_from")?;
         match self.lower_bound_binding {
             LowerBoundBinding::Integer | LowerBoundBinding::Numeric => Ok(raw.to_string()),
@@ -605,16 +712,15 @@ impl CursorPlan {
     }
 }
 
-/// 在阻塞线程中执行增量 SQL，并把结果整理成 `(cursor_raw, payload)` 元组。
 fn query_next_batch_blocking(
     connection: DmdbConnectionHandle,
     sql: String,
-    _lower_bound: Option<String>,
     query_timeout_secs: Option<usize>,
-) -> AnyResult<Vec<(String, String)>> {
+    batch_hint: usize,
+) -> DmdbResult<Vec<(String, String)>> {
     let conn_guard = connection
         .lock()
-        .map_err(|_| dmdb_err(DmdbReason::Lock, "lock dmdb source connection fail"))?;
+        .map_err(|_| dmdb_err(DmdbReason::Database, "lock dmdb source connection fail"))?;
     let Some(mut cursor) = conn_guard
         .execute(sql.as_str(), (), query_timeout_secs)
         .map_err(|err| {
@@ -628,78 +734,223 @@ fn query_next_batch_blocking(
     };
 
     // 查询结果固定为两列：游标值 + JSON payload。
-    let mut out = Vec::new();
+    // `get_text` 会沿用传入 Vec 的 capacity 作为首段 SQLGetData 缓冲；
+    // 若每行都从空 Vec 开始，达梦驱动会反复输出 `01004/String truncate` 告警。
+    let mut out = Vec::with_capacity(batch_hint);
+    let mut cursor_buf = Vec::with_capacity(INITIAL_CURSOR_BUF_CAPACITY);
+    let mut payload_buf = Vec::with_capacity(INITIAL_PAYLOAD_BUF_CAPACITY);
     while let Some(mut row) = cursor
         .next_row()
-        .source_raw_err(DmdbReason::Database, "read next dmdb source row failed")?
+        .source_raw_err(DmdbReason::Database, "iterate dmdb source cursor failed")?
     {
-        let mut cursor_buf = Vec::new();
-        let mut payload_buf = Vec::new();
+        cursor_buf.clear();
+        payload_buf.clear();
+
         let has_cursor = row
             .get_text(1, &mut cursor_buf)
-            .source_raw_err(DmdbReason::Database, "read dmdb cursor_value failed")?;
+            .map_err(|err| {
+                dmdb_err(DmdbReason::Database, format!("read dmdb cursor_value failed: {err}"))
+            })?;
         if !has_cursor {
             return Err(dmdb_err(
-                DmdbReason::Database,
+                DmdbReason::Cursor,
                 "dmdb source cursor_value must not be NULL",
             ));
         }
         let has_payload = row
             .get_text(2, &mut payload_buf)
-            .source_raw_err(DmdbReason::Database, "read dmdb payload failed")?;
+            .map_err(|err| {
+                dmdb_err(DmdbReason::Database, format!("read dmdb payload failed: {err}"))
+            })?;
         if !has_payload {
             return Err(dmdb_err(
                 DmdbReason::Database,
                 "dmdb source payload must not be NULL",
             ));
         }
-        let cursor_raw = String::from_utf8(cursor_buf)
-            .source_raw_err(DmdbReason::Parse, "dmdb cursor_value is not valid utf-8")?;
-        let payload = String::from_utf8(payload_buf)
-            .source_raw_err(DmdbReason::Parse, "dmdb payload is not valid utf-8")?;
+        let cursor_raw = std::str::from_utf8(&cursor_buf)
+            .map_err(|err| {
+                dmdb_err(
+                    DmdbReason::Parse,
+                    format!("dmdb cursor_value is not valid utf-8: {err}"),
+                )
+            })?
+            .to_owned();
+        let payload = std::str::from_utf8(&payload_buf)
+            .map_err(|err| {
+                dmdb_err(
+                    DmdbReason::Parse,
+                    format!("dmdb payload is not valid utf-8: {err}"),
+                )
+            })?
+            .to_owned();
         out.push((cursor_raw, payload));
     }
     Ok(out)
+}
+
+impl PrefetchWorker {
+    fn run(mut self) {
+        while !self.stop_flag.load(Ordering::SeqCst) {
+            let round = self.next_round();
+            let lower_bound = self.current_lower_bound.clone();
+            let started = Instant::now();
+            let rows = match self.fetch_rows(&lower_bound, round) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    warn_data!(
+                        "[dmdb-source] round={} query failed, backing off {:?}: {}",
+                        round,
+                        self.error_backoff,
+                        err
+                    );
+                    thread::sleep(self.error_backoff);
+                    continue;
+                }
+            };
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            self.log_round_end(round, &lower_bound, rows.len(), elapsed_ms);
+
+            if rows.is_empty() {
+                debug_ctrl!(
+                    "[dmdb-source] round={} no new rows, next poll after {:?} (lower_bound={:?})",
+                    round,
+                    self.poll_interval,
+                    lower_bound.as_deref()
+                );
+                thread::sleep(self.poll_interval);
+                continue;
+            }
+
+            let prepared = self.prepare_batch(rows, round, lower_bound);
+            if self.batch_tx.blocking_send(prepared).is_err() {
+                warn_ctrl!(
+                    "[dmdb-source] {} prefetch queue closed, worker exit",
+                    self.key
+                );
+                break;
+            }
+        }
+        warn_ctrl!("[dmdb-source] {} prefetch worker exited", self.key);
+    }
+
+    fn next_round(&mut self) -> u64 {
+        self.query_round += 1;
+        self.query_round
+    }
+
+    fn fetch_rows(
+        &self,
+        lower_bound: &Option<String>,
+        round: u64,
+    ) -> DmdbResult<Vec<(String, String)>> {
+        let sql = build_batch_query(
+            &self.table_ref,
+            &self.table_name,
+            &self.cursor_column,
+            lower_bound.as_deref(),
+            self.batch_size,
+            &self.cursor_plan,
+        );
+        debug_ctrl!(
+            "[dmdb-source] round={} query begin lower_bound={:?} batch_size={} timeout_secs={:?}",
+            round,
+            lower_bound.as_deref(),
+            self.batch_size,
+            self.query_timeout_secs
+        );
+        query_next_batch_blocking(
+            self.connection.clone(),
+            sql,
+            self.query_timeout_secs,
+            self.batch_size,
+        )
+    }
+
+    fn log_round_end(
+        &self,
+        round: u64,
+        lower_bound: &Option<String>,
+        row_count: usize,
+        elapsed_ms: u64,
+    ) {
+        debug_ctrl!(
+            "[dmdb-source] round={} query end rows={} elapsed_ms={} lower_bound={:?}",
+            round,
+            row_count,
+            elapsed_ms,
+            lower_bound.as_deref()
+        );
+    }
+
+    fn prepare_batch(
+        &mut self,
+        rows: Vec<(String, String)>,
+        round: u64,
+        lower_bound: Option<String>,
+    ) -> PreparedBatch {
+        let mut events = Vec::with_capacity(rows.len());
+        let mut last_cursor_raw = String::new();
+        for (cursor_raw, payload) in rows {
+            events.push(SourceEvent::new(
+                next_wp_event_id(),
+                self.key.clone(),
+                RawData::from_string(payload),
+                Arc::new(self.tags.clone()),
+            ));
+            last_cursor_raw = cursor_raw;
+        }
+        self.current_lower_bound = Some(last_cursor_raw.clone());
+        PreparedBatch {
+            events,
+            last_cursor_raw,
+            round,
+            lower_bound,
+        }
+    }
 }
 
 fn query_table_columns(
     connection: &DmdbConnectionHandle,
     schema: Option<&str>,
     table: &str,
-) -> AnyResult<Vec<DmdbColumnMeta>> {
-    let conn_guard = connection.lock().map_err(|_| {
-        dmdb_err(
-            DmdbReason::Lock,
-            "lock dmdb source connection for metadata fail",
-        )
-    })?;
+) -> DmdbResult<Vec<DmdbColumnMeta>> {
+    let conn_guard = connection
+        .lock()
+        .map_err(|_| {
+            dmdb_err(
+                DmdbReason::Database,
+                "lock dmdb source connection for metadata fail",
+            )
+        })?;
     let schema_pattern = schema.unwrap_or("");
     let table_pattern = table;
     // 通过 ODBC 元数据接口读取列顺序与类型，供查询构造和 JSON 序列化复用。
     let mut rows = Vec::new();
     for row_result in conn_guard
         .columns("", schema_pattern, table_pattern, "%")
-        .source_raw_err(
-            DmdbReason::Database,
-            "query dmdb table columns metadata failed",
-        )?
+        .source_raw_err(DmdbReason::Database, "query dmdb metadata columns failed")?
     {
         let row = row_result
-            .source_raw_err(DmdbReason::Database, "read dmdb table metadata row failed")?;
-        let table_name = row.table.as_str().source_raw_err(
-            DmdbReason::Parse,
-            "decode dmdb table metadata table name failed",
-        )?;
+            .source_raw_err(DmdbReason::Database, "read dmdb metadata row failed")?;
+        let table_name = row.table.as_str().map_err(|err| {
+            dmdb_err(
+                DmdbReason::Database,
+                format!("decode dmdb table metadata table name failed: {err}"),
+            )
+        })?;
         let Some(table_name) = table_name else {
             continue;
         };
         if !table_name.eq_ignore_ascii_case(table) {
             continue;
         }
-        let schema_name = row.schema.as_str().source_raw_err(
-            DmdbReason::Parse,
-            "decode dmdb table metadata schema name failed",
-        )?;
+        let schema_name = row.schema.as_str().map_err(|err| {
+            dmdb_err(
+                DmdbReason::Database,
+                format!("decode dmdb table metadata schema name failed: {err}"),
+            )
+        })?;
         if let Some(expected_schema) = schema
             && let Some(actual_schema) = schema_name
             && !actual_schema.eq_ignore_ascii_case(expected_schema)
@@ -709,10 +960,12 @@ fn query_table_columns(
         let column_name = row
             .column_name
             .as_str()
-            .source_raw_err(
-                DmdbReason::Parse,
-                "decode dmdb table metadata column name failed",
-            )?
+            .map_err(|err| {
+                dmdb_err(
+                    DmdbReason::Database,
+                    format!("decode dmdb table metadata column name failed: {err}"),
+                )
+            })?
             .ok_or_else(|| {
                 dmdb_err(
                     DmdbReason::Database,
@@ -722,10 +975,12 @@ fn query_table_columns(
         let type_name = row
             .type_name
             .as_str()
-            .source_raw_err(
-                DmdbReason::Parse,
-                "decode dmdb table metadata type name failed",
-            )?
+            .map_err(|err| {
+                dmdb_err(
+                    DmdbReason::Database,
+                    format!("decode dmdb table metadata type name failed: {err}"),
+                )
+            })?
             .unwrap_or("")
             .to_string();
         let data_type = DataType::new(
@@ -744,10 +999,7 @@ fn query_table_columns(
     Ok(rows)
 }
 
-/// 构造一行记录对应的 JSON payload 表达式。
-fn build_payload_expr(columns: &[DmdbColumnMeta], cursor_column: &str) -> AnyResult<String> {
-    // payload 保留游标列，便于下游 sink 继续使用数据库原始主键/递增列。
-    let _ = cursor_column;
+fn build_payload_expr(columns: &[DmdbColumnMeta]) -> DmdbResult<String> {
     let mut parts = Vec::with_capacity(columns.len() + 2);
     for column in columns {
         parts.push(format!(
@@ -758,7 +1010,7 @@ fn build_payload_expr(columns: &[DmdbColumnMeta], cursor_column: &str) -> AnyRes
     }
     parts.push("'warp_parse_table' VALUE t.__warp_parse_table".to_string());
     Ok(format!(
-        "CAST(JSON_OBJECT({} NULL ON NULL RETURNING VARCHAR2(32767)) AS VARCHAR(32767))",
+        "CAST(JSON_OBJECT({} NULL ON NULL) AS CLOB)",
         parts.join(", ")
     ))
 }
@@ -888,7 +1140,7 @@ fn validate_checkpoint_state(
     state: &CheckpointState,
     cursor_column: &str,
     cursor_plan: &CursorPlan,
-) -> AnyResult<()> {
+) -> DmdbResult<()> {
     if state.version != CHECKPOINT_VERSION {
         return Err(dmdb_err(
             DmdbReason::Checkpoint,
@@ -921,12 +1173,12 @@ fn validate_checkpoint_state(
 }
 
 /// 读取必填字符串配置，并去掉首尾空白。
-fn required_opt_field<'a>(name: &str, value: &'a Option<String>) -> AnyResult<&'a str> {
+fn required_opt_field<'a>(name: &str, value: &'a Option<String>) -> SourceResult<&'a str> {
     value
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| dmdb_err(DmdbReason::Config, format!("{name} must not be empty")))
+        .ok_or_else(|| SourceReason::other(format!("{name} must not be empty")))
 }
 
 /// 生成当前 Source 对应的 checkpoint 文件路径。
@@ -935,10 +1187,12 @@ fn checkpoint_path(source_key: &str) -> PathBuf {
 }
 
 /// 确保 checkpoint 目录存在，便于后续写入。
-fn ensure_checkpoint_dir(path: &Path) -> AnyResult<()> {
+fn ensure_checkpoint_dir(path: &Path) -> DmdbResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .source_err(DmdbReason::Io, "create dmdb checkpoint dir failed")?;
+        std::fs::create_dir_all(parent).source_err(
+            DmdbReason::Io,
+            format!("dmdb create checkpoint dir {} failed", parent.display()),
+        )?;
     }
     Ok(())
 }
@@ -957,7 +1211,7 @@ fn resolve_lower_bound<'a>(
 fn parse_start_from_format(
     raw: Option<&str>,
     cursor_type: CursorType,
-) -> AnyResult<Option<StartFromFormat>> {
+) -> DmdbResult<Option<StartFromFormat>> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -984,7 +1238,7 @@ fn normalize_optional_start_from(
     raw: Option<&str>,
     format: Option<&StartFromFormat>,
     session_offset: FixedOffset,
-) -> AnyResult<Option<String>> {
+) -> DmdbResult<Option<String>> {
     raw.map(|raw| cursor_plan.normalize_start_from(raw, format, session_offset))
         .transpose()
 }
@@ -994,7 +1248,7 @@ fn normalize_date_start_from(
     raw: &str,
     format: Option<&StartFromFormat>,
     session_offset: FixedOffset,
-) -> AnyResult<String> {
+) -> DmdbResult<String> {
     let date = if let Some(format) = format {
         parse_date_by_format(raw, format, session_offset)?
     } else {
@@ -1008,7 +1262,7 @@ fn normalize_timestamp_start_from(
     raw: &str,
     format: Option<&StartFromFormat>,
     session_offset: FixedOffset,
-) -> AnyResult<String> {
+) -> DmdbResult<String> {
     let datetime = if let Some(format) = format {
         parse_timestamp_by_format(raw, format, session_offset)?
     } else {
@@ -1022,7 +1276,7 @@ fn normalize_timestamptz_start_from(
     raw: &str,
     format: Option<&StartFromFormat>,
     session_offset: FixedOffset,
-) -> AnyResult<String> {
+) -> DmdbResult<String> {
     let datetime = if let Some(format) = format {
         parse_timestamptz_by_format(raw, format, session_offset)?
     } else {
@@ -1036,7 +1290,7 @@ fn parse_date_by_format(
     raw: &str,
     format: &StartFromFormat,
     session_offset: FixedOffset,
-) -> AnyResult<NaiveDate> {
+) -> DmdbResult<NaiveDate> {
     match format.kind {
         StartFromFormatKind::UnixSeconds => Ok(parse_unix_seconds(raw)?
             .with_timezone(&session_offset)
@@ -1046,16 +1300,20 @@ fn parse_date_by_format(
             .date_naive()),
         StartFromFormatKind::Pattern => {
             if pattern_has_offset(&format.raw) {
-                Ok(DateTime::parse_from_str(raw, &format.raw)
-                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
-                    .date_naive())
+                Ok(
+                    DateTime::parse_from_str(raw, &format.raw)
+                        .source_raw_err(DmdbReason::Time, "dmdb.start_from parse failed")?
+                        .date_naive(),
+                )
             } else if pattern_has_time(&format.raw) {
-                Ok(NaiveDateTime::parse_from_str(raw, &format.raw)
-                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
-                    .date())
+                Ok(
+                    NaiveDateTime::parse_from_str(raw, &format.raw)
+                        .source_raw_err(DmdbReason::Time, "dmdb.start_from parse failed")?
+                        .date(),
+                )
             } else {
                 NaiveDate::parse_from_str(raw, &format.raw)
-                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")
+                    .source_raw_err(DmdbReason::Time, "dmdb.start_from parse failed")
             }
         }
     }
@@ -1066,7 +1324,7 @@ fn parse_timestamp_by_format(
     raw: &str,
     format: &StartFromFormat,
     session_offset: FixedOffset,
-) -> AnyResult<NaiveDateTime> {
+) -> DmdbResult<NaiveDateTime> {
     match format.kind {
         StartFromFormatKind::UnixSeconds => Ok(parse_unix_seconds(raw)?
             .with_timezone(&session_offset)
@@ -1076,17 +1334,21 @@ fn parse_timestamp_by_format(
             .naive_local()),
         StartFromFormatKind::Pattern => {
             if pattern_has_offset(&format.raw) {
-                Ok(DateTime::parse_from_str(raw, &format.raw)
-                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
-                    .naive_local())
+                Ok(
+                    DateTime::parse_from_str(raw, &format.raw)
+                        .source_raw_err(DmdbReason::Time, "dmdb.start_from parse failed")?
+                        .naive_local(),
+                )
             } else if pattern_has_time(&format.raw) {
                 NaiveDateTime::parse_from_str(raw, &format.raw)
-                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")
+                    .source_raw_err(DmdbReason::Time, "dmdb.start_from parse failed")
             } else {
-                Ok(NaiveDate::parse_from_str(raw, &format.raw)
-                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
-                    .and_hms_opt(0, 0, 0)
-                    .ok_or_else(|| dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed"))?)
+                Ok(
+                    NaiveDate::parse_from_str(raw, &format.raw)
+                        .source_raw_err(DmdbReason::Time, "dmdb.start_from parse failed")?
+                        .and_hms_opt(0, 0, 0)
+                        .ok_or_else(|| dmdb_err(DmdbReason::Time, "dmdb.start_from parse failed"))?,
+                )
             }
         }
     }
@@ -1097,7 +1359,7 @@ fn parse_timestamptz_by_format(
     raw: &str,
     format: &StartFromFormat,
     session_offset: FixedOffset,
-) -> AnyResult<DateTime<FixedOffset>> {
+) -> DmdbResult<DateTime<FixedOffset>> {
     match format.kind {
         StartFromFormatKind::UnixSeconds => {
             Ok(parse_unix_seconds(raw)?.with_timezone(&session_offset))
@@ -1108,16 +1370,16 @@ fn parse_timestamptz_by_format(
         StartFromFormatKind::Pattern => {
             if pattern_has_offset(&format.raw) {
                 DateTime::parse_from_str(raw, &format.raw)
-                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")
+                    .source_raw_err(DmdbReason::Time, "dmdb.start_from parse failed")
             } else if pattern_has_time(&format.raw) {
                 let naive = NaiveDateTime::parse_from_str(raw, &format.raw)
-                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?;
+                    .source_raw_err(DmdbReason::Time, "dmdb.start_from parse failed")?;
                 bind_naive_to_fixed_offset(naive, session_offset, "dmdb.start_from")
             } else {
                 let naive = NaiveDate::parse_from_str(raw, &format.raw)
-                    .source_raw_err(DmdbReason::Parse, "dmdb.start_from parse failed")?
+                    .source_raw_err(DmdbReason::Time, "dmdb.start_from parse failed")?
                     .and_hms_opt(0, 0, 0)
-                    .ok_or_else(|| dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed"))?;
+                    .ok_or_else(|| dmdb_err(DmdbReason::Time, "dmdb.start_from parse failed"))?;
                 bind_naive_to_fixed_offset(naive, session_offset, "dmdb.start_from")
             }
         }
@@ -1125,7 +1387,7 @@ fn parse_timestamptz_by_format(
 }
 
 /// 在未显式指定格式时，按常见日期表示自动回退解析。
-fn parse_date_fallback(raw: &str, session_offset: FixedOffset) -> AnyResult<NaiveDate> {
+fn parse_date_fallback(raw: &str, session_offset: FixedOffset) -> DmdbResult<NaiveDate> {
     if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         return Ok(date);
     }
@@ -1140,7 +1402,7 @@ fn parse_date_fallback(raw: &str, session_offset: FixedOffset) -> AnyResult<Naiv
 }
 
 /// 在未显式指定格式时，按常见时间表示自动回退解析。
-fn parse_timestamp_fallback(raw: &str, session_offset: FixedOffset) -> AnyResult<NaiveDateTime> {
+fn parse_timestamp_fallback(raw: &str, session_offset: FixedOffset) -> DmdbResult<NaiveDateTime> {
     if let Ok(dt) = parse_naive_datetime_fallback(raw) {
         return Ok(dt);
     }
@@ -1150,7 +1412,7 @@ fn parse_timestamp_fallback(raw: &str, session_offset: FixedOffset) -> AnyResult
     if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         return date
             .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed"));
+            .ok_or_else(|| dmdb_err(DmdbReason::Time, "dmdb.start_from parse failed"));
     }
     Ok(parse_unix_auto(raw)?
         .with_timezone(&session_offset)
@@ -1161,7 +1423,7 @@ fn parse_timestamp_fallback(raw: &str, session_offset: FixedOffset) -> AnyResult
 fn parse_timestamptz_fallback(
     raw: &str,
     session_offset: FixedOffset,
-) -> AnyResult<DateTime<FixedOffset>> {
+) -> DmdbResult<DateTime<FixedOffset>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
         return Ok(dt);
     }
@@ -1171,51 +1433,52 @@ fn parse_timestamptz_fallback(
     if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         let naive = date
             .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed"))?;
+            .ok_or_else(|| dmdb_err(DmdbReason::Time, "dmdb.start_from parse failed"))?;
         return bind_naive_to_fixed_offset(naive, session_offset, "dmdb.start_from");
     }
     Ok(parse_unix_auto(raw)?.with_timezone(&session_offset))
 }
 
 /// 自动识别 10 位秒级或 13 位毫秒级 unix 时间戳。
-fn parse_unix_auto(raw: &str) -> AnyResult<DateTime<Utc>> {
+fn parse_unix_auto(raw: &str) -> DmdbResult<DateTime<Utc>> {
     match raw.len() {
         13 => parse_unix_millis(raw),
         10 => parse_unix_seconds(raw),
-        _ => Err(dmdb_err(DmdbReason::Parse, "dmdb.start_from parse failed")),
+        _ => Err(dmdb_err(DmdbReason::Time, "dmdb.start_from parse failed")),
     }
 }
 
 /// 解析秒级 unix 时间戳。
-fn parse_unix_seconds(raw: &str) -> AnyResult<DateTime<Utc>> {
-    let secs = raw.parse::<i64>().map_err(|err| {
-        dmdb_err(
-            DmdbReason::Parse,
-            format!("dmdb.start_from parse unix seconds failed: {err}"),
-        )
-    })?;
-    DateTime::<Utc>::from_timestamp(secs, 0).ok_or_else(|| {
-        dmdb_err(
-            DmdbReason::Time,
-            "dmdb.start_from unix seconds out of range",
-        )
-    })
+fn parse_unix_seconds(raw: &str) -> DmdbResult<DateTime<Utc>> {
+    let secs = raw
+        .parse::<i64>()
+        .map_err(|err| {
+            dmdb_err(
+                DmdbReason::Time,
+                format!("dmdb.start_from parse unix seconds failed: {err}"),
+            )
+        })?;
+    DateTime::<Utc>::from_timestamp(secs, 0)
+        .ok_or_else(|| dmdb_err(DmdbReason::Time, "dmdb.start_from unix seconds out of range"))
 }
 
 /// 解析毫秒级 unix 时间戳。
-fn parse_unix_millis(raw: &str) -> AnyResult<DateTime<Utc>> {
-    let millis = raw.parse::<i64>().map_err(|err| {
-        dmdb_err(
-            DmdbReason::Parse,
-            format!("dmdb.start_from parse unix milliseconds failed: {err}"),
-        )
-    })?;
-    DateTime::<Utc>::from_timestamp_millis(millis).ok_or_else(|| {
-        dmdb_err(
-            DmdbReason::Time,
-            "dmdb.start_from unix milliseconds out of range",
-        )
-    })
+fn parse_unix_millis(raw: &str) -> DmdbResult<DateTime<Utc>> {
+    let millis = raw
+        .parse::<i64>()
+        .map_err(|err| {
+            dmdb_err(
+                DmdbReason::Time,
+                format!("dmdb.start_from parse unix milliseconds failed: {err}"),
+            )
+        })?;
+    DateTime::<Utc>::from_timestamp_millis(millis)
+        .ok_or_else(|| {
+            dmdb_err(
+                DmdbReason::Time,
+                "dmdb.start_from unix milliseconds out of range",
+            )
+        })
 }
 
 /// 按常见无时区时间格式解析输入。
@@ -1229,13 +1492,16 @@ fn bind_naive_to_fixed_offset(
     naive: NaiveDateTime,
     offset: FixedOffset,
     field_name: &str,
-) -> AnyResult<DateTime<FixedOffset>> {
-    offset.from_local_datetime(&naive).single().ok_or_else(|| {
-        dmdb_err(
-            DmdbReason::Time,
-            format!("{field_name} is ambiguous or invalid in fixed timezone"),
-        )
-    })
+) -> DmdbResult<DateTime<FixedOffset>> {
+    offset
+        .from_local_datetime(&naive)
+        .single()
+        .ok_or_else(|| {
+            dmdb_err(
+                DmdbReason::Time,
+                format!("{field_name} is ambiguous or invalid in fixed timezone"),
+            )
+        })
 }
 
 /// 判断格式串是否显式包含时区偏移。
@@ -1433,6 +1699,7 @@ mod tests {
     }
 
     #[test]
+
     fn build_payload_expr_adds_table_field() {
         let columns = vec![
             DmdbColumnMeta {
@@ -1448,9 +1715,10 @@ mod tests {
                 ordinal_position: 2,
             },
         ];
-        let expr = build_payload_expr(&columns, "id").expect("build payload expr");
+        let expr = build_payload_expr(&columns).expect("build payload expr");
         assert!(expr.contains("'id' VALUE t.\"id\""));
         assert!(expr.contains("'name' VALUE t.\"name\""));
         assert!(expr.contains("'warp_parse_table' VALUE t.__warp_parse_table"));
+        assert!(expr.contains("AS CLOB"));
     }
 }

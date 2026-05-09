@@ -1,7 +1,6 @@
 use super::config::DmdbConnConf;
-use super::error::{DmdbReason, DmdbResult, dmdb_err};
+use super::source::{DmdbReason, DmdbResult, dmdb_err};
 use odbc_api::{Connection, ConnectionOptions, environment};
-use orion_error::prelude::SourceRawErr;
 use std::sync::{Arc, Mutex};
 use tokio::task;
 
@@ -17,14 +16,20 @@ pub(crate) async fn connect_shared(config: &DmdbConnConf) -> DmdbResult<DmdbConn
     let config = config.clone();
     task::spawn_blocking(move || connect_shared_blocking(&config))
         .await
-        .source_raw_err(DmdbReason::Runtime, "spawn dmdb connect task failed")?
+        .map_err(|err| dmdb_err(DmdbReason::Database, format!("spawn dmdb connect task failed: {err}")))?
 }
 
 /// 在阻塞上下文中建立达梦连接句柄。
-pub(crate) fn connect_shared_blocking(config: &DmdbConnConf) -> DmdbResult<DmdbConnectionHandle> {
+pub(crate) fn connect_shared_blocking(
+    config: &DmdbConnConf,
+) -> DmdbResult<DmdbConnectionHandle> {
     // ODBC Environment 需要和连接生命周期保持一致，这里使用全局 environment。
-    let env =
-        environment().source_raw_err(DmdbReason::Connection, "acquire odbc environment fail")?;
+    let env = environment().map_err(|err| {
+        dmdb_err(
+            DmdbReason::Database,
+            format!("acquire odbc environment fail: {err}"),
+        )
+    })?;
     let options = config.connect_options();
     let connection = open_connection(env, config, options)?;
     Ok(Arc::new(Mutex::new(connection)))
@@ -42,20 +47,24 @@ pub(crate) fn open_connection(
     {
         return env
             .connect_with_connection_string(connection_string, options)
-            .source_raw_err(
-                DmdbReason::Connection,
-                "connect dmdb with connection_string fail",
-            );
+            .map_err(|err| {
+                dmdb_err(
+                    DmdbReason::Database,
+                    format!("connect dmdb with connection_string fail: {err}"),
+                )
+            });
     }
 
     if !config.endpoint.trim().is_empty() {
         let connection_string = config.generated_connection_string()?;
         return env
             .connect_with_connection_string(connection_string.as_str(), options)
-            .source_raw_err(
-                DmdbReason::Connection,
-                "connect dmdb with generated connection string fail",
-            );
+            .map_err(|err| {
+                dmdb_err(
+                    DmdbReason::Database,
+                    format!("connect dmdb with generated connection string fail: {err}"),
+                )
+            });
     }
 
     if let Some(dsn) = config.dsn.as_deref().map(str::trim)
@@ -68,7 +77,12 @@ pub(crate) fn open_connection(
                 config.password.as_str(),
                 options,
             )
-            .source_raw_err(DmdbReason::Connection, "connect dmdb with dsn fail");
+            .map_err(|err| {
+                dmdb_err(
+                    DmdbReason::Database,
+                    format!("connect dmdb with dsn fail: {err}"),
+                )
+            });
     }
 
     Err(dmdb_err(

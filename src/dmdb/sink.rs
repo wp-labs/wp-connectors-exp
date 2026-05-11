@@ -229,14 +229,12 @@ fn execute_statements_in_transaction(
         .map_err(|_| dmdb_err(DmdbReason::Database, "lock dmdb connection fail"))?;
 
     // 整次 sink_records 共用一个事务，避免前半批成功、后半批失败后留下部分写入。
-    conn_guard
-        .set_autocommit(false)
-        .map_err(|err| {
-            dmdb_err(
-                DmdbReason::Database,
-                format!("set dmdb autocommit=false fail: {err}"),
-            )
-        })?;
+    conn_guard.set_autocommit(false).map_err(|err| {
+        dmdb_err(
+            DmdbReason::Database,
+            format!("set dmdb autocommit=false fail: {err}"),
+        )
+    })?;
 
     let result = (|| -> DmdbResult<()> {
         for statement in &statements {
@@ -251,14 +249,12 @@ fn execute_statements_in_transaction(
                 })?;
         }
 
-        conn_guard
-            .commit()
-            .map_err(|err| {
-                dmdb_err(
-                    DmdbReason::Database,
-                    format!("commit dmdb transaction fail: {err}"),
-                )
-            })?;
+        conn_guard.commit().map_err(|err| {
+            dmdb_err(
+                DmdbReason::Database,
+                format!("commit dmdb transaction fail: {err}"),
+            )
+        })?;
 
         Ok(())
     })();

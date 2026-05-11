@@ -16,13 +16,16 @@ pub(crate) async fn connect_shared(config: &DmdbConnConf) -> DmdbResult<DmdbConn
     let config = config.clone();
     task::spawn_blocking(move || connect_shared_blocking(&config))
         .await
-        .map_err(|err| dmdb_err(DmdbReason::Database, format!("spawn dmdb connect task failed: {err}")))?
+        .map_err(|err| {
+            dmdb_err(
+                DmdbReason::Database,
+                format!("spawn dmdb connect task failed: {err}"),
+            )
+        })?
 }
 
 /// 在阻塞上下文中建立达梦连接句柄。
-pub(crate) fn connect_shared_blocking(
-    config: &DmdbConnConf,
-) -> DmdbResult<DmdbConnectionHandle> {
+pub(crate) fn connect_shared_blocking(config: &DmdbConnConf) -> DmdbResult<DmdbConnectionHandle> {
     // ODBC Environment 需要和连接生命周期保持一致，这里使用全局 environment。
     let env = environment().map_err(|err| {
         dmdb_err(

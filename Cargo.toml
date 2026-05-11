@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/wp-labs/wp-connectors"
 
 [features]
-default = []
+default = ["dmdb"]
 dmdb = ["dep:odbc-api"]
 
 [dependencies]
@@ -29,6 +29,7 @@ educe = { version = "0.6", default-features = false, features = ["Debug", "Defau
 bytes = "1"
 odbc-api = { version = "24.1", default-features = false, features = ["odbc_version_3_5"], optional = true }
 thiserror = "2"
+hex = "0.4"
 
 [dev-dependencies]
 wp-connector-test-utils = { version = "0.2.0", git = "https://github.com/wp-labs/wp-connector-test-utils.git" }

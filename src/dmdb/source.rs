@@ -2,14 +2,12 @@ use super::common::{
     DmdbConnectionHandle, connect_shared_blocking, escape_sql_literal, quote_identifier,
 };
 use super::config::DmdbSourceConf;
+use super::odbc_dyn::DmdbDataType;
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
-use odbc_api::sys::SqlDataType;
-use odbc_api::{Cursor, CursorRow, DataType};
 use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use orion_error::{OrionError, StructError, UnifiedReason};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -25,6 +23,8 @@ use wp_connector_api::{
 use wp_log::{debug_ctrl, info_ctrl, info_data, warn_ctrl, warn_data};
 use wp_model_core::event_id::next_wp_event_id;
 use wp_model_core::raw::RawData;
+
+// ===== 错误模型 =====
 
 pub(crate) type DmdbError = StructError<DmdbReason>;
 pub(crate) type DmdbResult<T> = Result<T, DmdbError>;
@@ -54,6 +54,8 @@ pub(crate) fn dmdb_err(reason: DmdbReason, detail: impl Into<String>) -> DmdbErr
     reason.to_err().with_detail(detail)
 }
 
+// ===== 运行时默认值 =====
+
 const DEFAULT_BATCH: usize = 2048;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_ERROR_BACKOFF_MS: u64 = 2000;
@@ -65,6 +67,77 @@ const INITIAL_CURSOR_BUF_CAPACITY: usize = 128;
 const INITIAL_PAYLOAD_BUF_CAPACITY: usize = 64 * 1024;
 /// 预取队列按“批次”限流，避免后台无限预取导致内存膨胀。
 const PREFETCH_QUEUE_CAPACITY: usize = 8;
+
+// ===== 游标、checkpoint 与元数据静态模型 =====
+
+/// 用户可配置的游标语义，目前支持整数游标和时间游标两类。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorType {
+    Int,
+    Time,
+}
+
+/// lower bound 在 SQL 中的绑定策略，取决于游标列的真实数据库类型。
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LowerBoundBinding {
+    /// 普通整数列，使用整数比较。
+    Integer,
+    /// NUMBER/DECIMAL/FLOAT 等数值列，允许小数。
+    Numeric,
+    /// DATE 列，序列化为 `YYYY-MM-DD`。
+    Date,
+    /// TIMESTAMP（无时区）列，序列化为 `YYYY-MM-DD HH24:MI:SS.FF6`。
+    Timestamp,
+    /// TIMESTAMP WITH TIME ZONE 列，序列化为带偏移的 RFC3339 风格文本。
+    TimestampTz,
+}
+
+/// 启动阶段基于表元数据推导出的游标执行计划。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CursorPlan {
+    /// 用户声明的游标语义类型。
+    cursor_type: CursorType,
+    /// 由真实列类型推导出的 lower bound 绑定方式。
+    lower_bound_binding: LowerBoundBinding,
+    /// 生成 payload JSON 的 SQL 片段。
+    payload_expr: String,
+}
+
+/// `start_from_format` 的解析模式，用来区分 unix 时间戳和自定义时间格式。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartFromFormatKind {
+    UnixSeconds,
+    UnixMillis,
+    Pattern,
+}
+
+/// 用户声明的 `start_from` 格式定义。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StartFromFormat {
+    raw: String,
+    kind: StartFromFormatKind,
+}
+
+/// 本地 checkpoint 文件结构。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointState {
+    version: u32,
+    cursor_type: String,
+    cursor_column: String,
+    last_cursor_raw: String,
+    updated_at: String,
+}
+
+/// 从 ODBC 元数据接口提取出的列信息，用于构建查询和序列化 payload。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DmdbColumnMeta {
+    name: String,
+    type_name: String,
+    data_type: DmdbDataType,
+    ordinal_position: i32,
+}
+
+// ===== Source 与预取 worker 运行时结构 =====
 
 /// 运行时会维护本地 checkpoint，以便重启后从上次成功消费位置继续拉取。
 pub struct DmdbSource {
@@ -104,6 +177,7 @@ pub struct DmdbSource {
     worker_handle: Option<thread::JoinHandle<()>>,
 }
 
+/// 后台 worker 预取完成后投递给 Source 主循环的批次载体。
 #[derive(Debug)]
 struct PreparedBatch {
     events: SourceBatch,
@@ -112,6 +186,7 @@ struct PreparedBatch {
     lower_bound: Option<String>,
 }
 
+/// 独立阻塞线程中的预取 worker，负责循环执行 SQL 并把结果批次送入队列。
 struct PrefetchWorker {
     key: String,
     connection: DmdbConnectionHandle,
@@ -129,6 +204,8 @@ struct PrefetchWorker {
     query_round: u64,
     current_lower_bound: Option<String>,
 }
+
+// ===== Source 生命周期与 checkpoint 管理 =====
 
 impl DmdbSource {
     /// 返回 Source 标识，供运行时与日志复用。
@@ -148,7 +225,7 @@ impl DmdbSource {
                 .filter(|value| !value.is_empty())
                 .unwrap_or("int"),
         )
-        .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+        .map_err(|e| SourceReason::other(format!("initialize dmdb source failed: {e}")))?;
 
         // 建连走阻塞线程，避免 ODBC 调用卡住 Tokio runtime。
         let connection = {
@@ -159,7 +236,7 @@ impl DmdbSource {
                     SourceReason::Other,
                     "initialize dmdb source failed: spawn connect task failed",
                 )?
-                .source_err(SourceReason::Other, "initialize dmdb source failed")?
+                .map_err(|e| SourceReason::other(format!("initialize dmdb source failed: {e}")))?
         };
 
         let schema = normalized_schema(config.conn.schema.as_deref());
@@ -183,12 +260,12 @@ impl DmdbSource {
                 SourceReason::Other,
                 "initialize dmdb source failed: spawn cursor plan task failed",
             )?
-            .source_err(SourceReason::Other, "initialize dmdb source failed")?
+            .map_err(|e| SourceReason::other(format!("initialize dmdb source failed: {e}")))?
         };
 
         let start_from_format =
             parse_start_from_format(config.start_from_format.as_deref(), cursor_type)
-                .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+                .map_err(|e| SourceReason::other(format!("initialize dmdb source failed: {e}")))?;
         let session_offset = FixedOffset::east_opt(0)
             .ok_or_else(|| SourceReason::other("build UTC fixed offset failed"))?;
         // `start_from` 会先标准化为数据库可稳定比较的文本形式。
@@ -198,7 +275,7 @@ impl DmdbSource {
             start_from_format.as_ref(),
             session_offset,
         )
-        .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+        .map_err(|e| SourceReason::other(format!("initialize dmdb source failed: {e}")))?;
 
         let batch = config.batch.unwrap_or(DEFAULT_BATCH).max(1);
         let poll_interval =
@@ -209,12 +286,12 @@ impl DmdbSource {
         let table_ref = qualified_table_name(schema.as_deref(), table);
         let checkpoint_path = checkpoint_path(&key);
         let checkpoint = Self::load_checkpoint(&checkpoint_path, cursor_column, &cursor_plan)
-            .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+            .map_err(|e| SourceReason::other(format!("initialize dmdb source failed: {e}")))?;
         // checkpoint 优先于 start_from，避免 Source 重启后重复回到初始位点。
         if let Some(lower_bound) = resolve_lower_bound(checkpoint.as_ref(), start_from.as_deref()) {
             cursor_plan
                 .validate_lower_bound(lower_bound, "dmdb active lower bound")
-                .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+                .map_err(|e| SourceReason::other(format!("initialize dmdb source failed: {e}")))?;
         }
 
         info_data!(
@@ -420,6 +497,8 @@ impl DataSource for DmdbSource {
     }
 }
 
+// ===== 游标计划行为与 Source 配置校验 =====
+
 /// 校验 Source 侧游标类型与 `start_from` 相关配置是否匹配。
 pub(crate) fn validate_source_cursor_type_and_start_from(
     raw_cursor_type: &str,
@@ -429,72 +508,6 @@ pub(crate) fn validate_source_cursor_type_and_start_from(
     let cursor_type = CursorType::from_config(raw_cursor_type)?;
     cursor_type.validate_start_from(start_from, start_from_format)?;
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// 用户可配置的游标语义，目前支持整数游标和时间游标两类。
-enum CursorType {
-    Int,
-    Time,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// lower bound 在 SQL 中的绑定策略，取决于游标列的真实数据库类型。
-enum LowerBoundBinding {
-    /// 普通整数列，使用整数比较。
-    Integer,
-    /// NUMBER/DECIMAL/FLOAT 等数值列，允许小数。
-    Numeric,
-    /// DATE 列，序列化为 `YYYY-MM-DD`。
-    Date,
-    /// TIMESTAMP（无时区）列，序列化为 `YYYY-MM-DD HH24:MI:SS.FF6`。
-    Timestamp,
-    /// TIMESTAMP WITH TIME ZONE 列，序列化为带偏移的 RFC3339 风格文本。
-    TimestampTz,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CursorPlan {
-    /// 用户声明的游标语义类型。
-    cursor_type: CursorType,
-    /// 由真实列类型推导出的 lower bound 绑定方式。
-    lower_bound_binding: LowerBoundBinding,
-    /// 输出 payload 时需要保留的列顺序与类型信息。
-    payload_columns: Vec<DmdbColumnMeta>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// `start_from_format` 的解析模式，用来区分 unix 时间戳和自定义时间格式。
-enum StartFromFormatKind {
-    UnixSeconds,
-    UnixMillis,
-    Pattern,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// 用户声明的 `start_from` 格式定义。
-struct StartFromFormat {
-    raw: String,
-    kind: StartFromFormatKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// 本地 checkpoint 文件结构。
-struct CheckpointState {
-    version: u32,
-    cursor_type: String,
-    cursor_column: String,
-    last_cursor_raw: String,
-    updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// 从 ODBC 元数据接口提取出的列信息，用于构建查询和序列化 payload。
-struct DmdbColumnMeta {
-    name: String,
-    type_name: String,
-    data_type: DataType,
-    ordinal_position: i32,
 }
 
 impl CursorType {
@@ -555,7 +568,7 @@ impl CursorType {
     fn lower_bound_binding(
         self,
         cursor_column: &str,
-        data_type: &DataType,
+        data_type: &DmdbDataType,
         type_name: &str,
     ) -> DmdbResult<LowerBoundBinding> {
         match self {
@@ -632,11 +645,12 @@ impl CursorPlan {
             &cursor_meta.data_type,
             &cursor_meta.type_name,
         )?;
+        let payload_expr = build_payload_expr(&columns)?;
 
         Ok(Self {
             cursor_type,
             lower_bound_binding,
-            payload_columns: columns,
+            payload_expr,
         })
     }
 
@@ -713,19 +727,19 @@ impl CursorPlan {
     }
 }
 
+// ===== Worker 执行与批次封装 =====
+
 fn query_next_batch_blocking(
     connection: DmdbConnectionHandle,
     sql: String,
     query_timeout_secs: Option<usize>,
     batch_hint: usize,
-    table_name: &str,
-    columns: &[DmdbColumnMeta],
 ) -> DmdbResult<Vec<(String, String)>> {
     let conn_guard = connection
         .lock()
         .map_err(|_| dmdb_err(DmdbReason::Database, "lock dmdb source connection fail"))?;
     let Some(mut cursor) = conn_guard
-        .execute(sql.as_str(), (), query_timeout_secs)
+        .execute(sql.as_str(), query_timeout_secs)
         .map_err(|err| {
             dmdb_err(
                 DmdbReason::Database,
@@ -735,30 +749,23 @@ fn query_next_batch_blocking(
     else {
         return Ok(Vec::new());
     };
-    // 查询结果为“原始列 + 游标辅助列”，由 Rust 侧组装 JSON payload，
-    // 这样可以把 SQL 控制在分页/排序职责内，避免数据库额外承担 JSON_OBJECT 投影成本。
+
+    // 查询结果固定为两列：游标值 + JSON payload。
+    // `get_text` 会沿用传入 Vec 的 capacity 作为首段 SQLGetData 缓冲；
+    // 若每行都从空 Vec 开始，达梦驱动会反复输出 `01004/String truncate` 告警。
     let mut out = Vec::with_capacity(batch_hint);
     let mut cursor_buf = Vec::with_capacity(INITIAL_CURSOR_BUF_CAPACITY);
-    let mut value_buf = Vec::with_capacity(INITIAL_PAYLOAD_BUF_CAPACITY);
-    let mut binary_buf = Vec::with_capacity(INITIAL_PAYLOAD_BUF_CAPACITY);
-    while let Some(mut row) = cursor
-        .next_row()
-        .source_raw_err(DmdbReason::Database, "iterate dmdb source cursor failed")?
-    {
+    let mut payload_buf = Vec::with_capacity(INITIAL_PAYLOAD_BUF_CAPACITY);
+    while let Some(row) = cursor.next_row().map_err(|err| {
+        dmdb_err(
+            DmdbReason::Database,
+            format!("iterate dmdb source cursor failed: {err}"),
+        )
+    })? {
         cursor_buf.clear();
-        value_buf.clear();
-        binary_buf.clear();
+        payload_buf.clear();
 
-        let payload = build_payload_json(
-            &mut row,
-            columns,
-            table_name,
-            &mut value_buf,
-            &mut binary_buf,
-        )?;
-
-        let cursor_index = (columns.len() + 1) as u16;
-        let has_cursor = row.get_text(cursor_index, &mut cursor_buf).map_err(|err| {
+        let has_cursor = row.get_text(1, &mut cursor_buf).map_err(|err| {
             dmdb_err(
                 DmdbReason::Database,
                 format!("read dmdb cursor_value failed: {err}"),
@@ -770,11 +777,31 @@ fn query_next_batch_blocking(
                 "dmdb source cursor_value must not be NULL",
             ));
         }
+        let has_payload = row.get_text(2, &mut payload_buf).map_err(|err| {
+            dmdb_err(
+                DmdbReason::Database,
+                format!("read dmdb payload failed: {err}"),
+            )
+        })?;
+        if !has_payload {
+            return Err(dmdb_err(
+                DmdbReason::Database,
+                "dmdb source payload must not be NULL",
+            ));
+        }
         let cursor_raw = std::str::from_utf8(&cursor_buf)
             .map_err(|err| {
                 dmdb_err(
                     DmdbReason::Parse,
                     format!("dmdb cursor_value is not valid utf-8: {err}"),
+                )
+            })?
+            .to_owned();
+        let payload = std::str::from_utf8(&payload_buf)
+            .map_err(|err| {
+                dmdb_err(
+                    DmdbReason::Parse,
+                    format!("dmdb payload is not valid utf-8: {err}"),
                 )
             })?
             .to_owned();
@@ -840,6 +867,7 @@ impl PrefetchWorker {
     ) -> DmdbResult<Vec<(String, String)>> {
         let sql = build_batch_query(
             &self.table_ref,
+            &self.table_name,
             &self.cursor_column,
             lower_bound.as_deref(),
             self.batch_size,
@@ -852,17 +880,11 @@ impl PrefetchWorker {
             self.batch_size,
             self.query_timeout_secs
         );
-        debug_ctrl!(
-            "query_next_batch_blocking, sql: {sql}, start_time: {:?}",
-            Instant::now()
-        );
         query_next_batch_blocking(
             self.connection.clone(),
             sql,
             self.query_timeout_secs,
             self.batch_size,
-            &self.table_name,
-            &self.cursor_plan.payload_columns,
         )
     }
 
@@ -909,6 +931,8 @@ impl PrefetchWorker {
     }
 }
 
+// ===== 元数据读取与 SQL 构造 =====
+
 fn query_table_columns(
     connection: &DmdbConnectionHandle,
     schema: Option<&str>,
@@ -921,238 +945,138 @@ fn query_table_columns(
         )
     })?;
     let schema_pattern = schema.unwrap_or("");
-    let table_pattern = table;
-    // 通过 ODBC 元数据接口读取列顺序与类型，供查询构造和 JSON 序列化复用。
+    let all_columns = conn_guard
+        .columns("", schema_pattern, table, "%")
+        .map_err(|err| {
+            dmdb_err(
+                DmdbReason::Database,
+                format!("query dmdb metadata columns failed: {err}"),
+            )
+        })?;
+
     let mut rows = Vec::new();
-    for row_result in conn_guard
-        .columns("", schema_pattern, table_pattern, "%")
-        .source_raw_err(DmdbReason::Database, "query dmdb metadata columns failed")?
-    {
-        let row =
-            row_result.source_raw_err(DmdbReason::Database, "read dmdb metadata row failed")?;
-        let table_name = row.table.as_str().map_err(|err| {
-            dmdb_err(
-                DmdbReason::Database,
-                format!("decode dmdb table metadata table name failed: {err}"),
-            )
-        })?;
-        let Some(table_name) = table_name else {
-            continue;
-        };
-        if !table_name.eq_ignore_ascii_case(table) {
+    for col in all_columns {
+        if !col.table_name.eq_ignore_ascii_case(table) {
             continue;
         }
-        let schema_name = row.schema.as_str().map_err(|err| {
-            dmdb_err(
-                DmdbReason::Database,
-                format!("decode dmdb table metadata schema name failed: {err}"),
-            )
-        })?;
-        if let Some(expected_schema) = schema
-            && let Some(actual_schema) = schema_name
-            && !actual_schema.eq_ignore_ascii_case(expected_schema)
-        {
-            continue;
+        if let Some(expected_schema) = schema {
+            let actual = col.schema_name.as_deref().unwrap_or("");
+            if !actual.eq_ignore_ascii_case(expected_schema) {
+                continue;
+            }
         }
-        let column_name = row
-            .column_name
-            .as_str()
-            .map_err(|err| {
-                dmdb_err(
-                    DmdbReason::Database,
-                    format!("decode dmdb table metadata column name failed: {err}"),
-                )
-            })?
-            .ok_or_else(|| {
-                dmdb_err(
-                    DmdbReason::Database,
-                    "dmdb table metadata column name is NULL",
-                )
-            })?;
-        let type_name = row
-            .type_name
-            .as_str()
-            .map_err(|err| {
-                dmdb_err(
-                    DmdbReason::Database,
-                    format!("decode dmdb table metadata type name failed: {err}"),
-                )
-            })?
-            .unwrap_or("")
-            .to_string();
-        let data_type = DataType::new(
-            SqlDataType(row.data_type),
-            row.column_size.into_opt().unwrap_or_default().max(0) as usize,
-            row.decimal_digits.into_opt().unwrap_or_default(),
+        let data_type = DmdbDataType::from_odbc_meta(
+            col.sql_data_type,
+            col.column_size.max(0) as usize,
+            col.decimal_digits,
         );
         rows.push(DmdbColumnMeta {
-            name: column_name.to_string(),
-            type_name,
+            name: col.column_name,
+            type_name: col.type_name,
             data_type,
-            ordinal_position: row.ordinal_position,
+            ordinal_position: col.ordinal_position,
         });
     }
     rows.sort_by_key(|row| row.ordinal_position);
     Ok(rows)
 }
 
+fn build_payload_expr(columns: &[DmdbColumnMeta]) -> DmdbResult<String> {
+    let mut parts = Vec::with_capacity(columns.len() + 2);
+    for column in columns {
+        parts.push(format!(
+            "'{}' VALUE {}",
+            escape_sql_literal(&column.name),
+            json_value_expr(column)
+        ));
+    }
+    parts.push("'warp_parse_table' VALUE t.__warp_parse_table".to_string());
+    Ok(format!(
+        "CAST(JSON_OBJECT({} NULL ON NULL) AS CLOB)",
+        parts.join(", ")
+    ))
+}
+
+/// 将单列引用转换成适合 `JSON_OBJECT` 的 SQL 表达式。
+fn json_value_expr(column: &DmdbColumnMeta) -> String {
+    let column_ref = format!("t.{}", quote_identifier(&column.name));
+    match &column.data_type {
+        DmdbDataType::Binary { .. }
+        | DmdbDataType::Varbinary { .. }
+        | DmdbDataType::LongVarbinary { .. } => {
+            format!("RAWTOHEX({column_ref})")
+        }
+        DmdbDataType::Date => {
+            format!("TO_CHAR({column_ref}, 'YYYY-MM-DD')")
+        }
+        DmdbDataType::Time { .. } => {
+            format!("TO_CHAR({column_ref}, 'HH24:MI:SS.FF6')")
+        }
+        DmdbDataType::Timestamp { .. } => {
+            let type_name = column.type_name.to_ascii_uppercase();
+            if type_name.contains("WITH TIME ZONE") || type_name.contains("TIME ZONE") {
+                format!("TO_CHAR({column_ref}, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF6TZH:TZM')")
+            } else {
+                format!("TO_CHAR({column_ref}, 'YYYY-MM-DD HH24:MI:SS.FF6')")
+            }
+        }
+        _ => column_ref,
+    }
+}
+
 /// 组装增量拉取 SQL，内层负责过滤与排序，外层负责把游标转成文本返回 Rust。
 fn build_batch_query(
     table_ref: &str,
+    table_name: &str,
     cursor_column: &str,
     lower_bound: Option<&str>,
     batch: usize,
     cursor_plan: &CursorPlan,
 ) -> String {
     let cursor_expr = format!("t.{}", quote_identifier(cursor_column));
-    if let Some(lower_bound) = lower_bound {
+    let payload_expr = &cursor_plan.payload_expr;
+    let base_select = if let Some(lower_bound) = lower_bound {
         let lower_bound_expr = cursor_plan
             .lower_bound_sql_literal(lower_bound)
             .unwrap_or_else(|_| "NULL".to_string());
-        return format!(
-            "SELECT t.*, {cursor_expr} AS \"__warp_cursor_value\" \
+        format!(
+            "SELECT t.*, '{}' AS __warp_parse_table, \
+                {cursor_expr} AS \"__warp_cursor_value\" \
              FROM {table_ref} t \
              WHERE {cursor_expr} > {lower_bound_expr} \
-             ORDER BY {cursor_expr} ASC LIMIT {batch}"
-        );
-    }
+             ORDER BY {cursor_expr} ASC LIMIT {batch}",
+            escape_sql_literal(table_name)
+        )
+    } else {
+        format!(
+            "SELECT t.*, '{}' AS __warp_parse_table, \
+                {cursor_expr} AS \"__warp_cursor_value\" \
+             FROM {table_ref} t \
+             ORDER BY {cursor_expr} ASC LIMIT {batch}",
+            escape_sql_literal(table_name)
+        )
+    };
 
+    // 先通过 base 子查询完成 keyset 分页，再只对截断后的 batch 生成 payload，
+    // 避免达梦在大结果集上提前执行 JSON_OBJECT 这类昂贵投影。
+    // 外层排序仍必须基于原始游标类型，不能按 cast 后的 cursor_value 文本排序，
+    // 否则整数游标会退化成字符串字典序，导致 checkpoint 回退并重复拉取整段数据。
     format!(
-        "SELECT t.*, {cursor_expr} AS \"__warp_cursor_value\" \
-         FROM {table_ref} t \
-         ORDER BY {cursor_expr} ASC LIMIT {batch}"
+        "WITH base AS ({base_select}) \
+         SELECT CAST(t.\"__warp_cursor_value\" AS VARCHAR(128)) AS cursor_value, \
+            {payload_expr} AS payload \
+         FROM base t ORDER BY t.\"__warp_cursor_value\" ASC"
     )
 }
 
-fn build_payload_json(
-    row: &mut CursorRow<'_>,
-    columns: &[DmdbColumnMeta],
-    table_name: &str,
-    value_buf: &mut Vec<u8>,
-    binary_buf: &mut Vec<u8>,
-) -> DmdbResult<String> {
-    let mut payload = JsonMap::with_capacity(columns.len() + 1);
-    for (index, column) in columns.iter().enumerate() {
-        let value = read_column_json_value(row, (index + 1) as u16, column, value_buf, binary_buf)?;
-        payload.insert(column.name.clone(), value);
-    }
-    payload.insert(
-        "warp_parse_table".to_string(),
-        JsonValue::String(table_name.to_string()),
-    );
-    serde_json::to_string(&payload).map_err(|err| {
-        dmdb_err(
-            DmdbReason::Parse,
-            format!("serialize dmdb payload json failed: {err}"),
-        )
-    })
-}
-
-enum RawColumnValue<'a> {
-    Null,
-    Text(&'a str),
-    Binary(&'a [u8]),
-}
-
-fn read_column_raw_value<'a>(
-    row: &mut CursorRow<'_>,
-    column_index: u16,
-    column: &DmdbColumnMeta,
-    text_buf: &'a mut Vec<u8>,
-    binary_buf: &'a mut Vec<u8>,
-) -> DmdbResult<RawColumnValue<'a>> {
-    match &column.data_type {
-        DataType::Binary { .. } | DataType::Varbinary { .. } | DataType::LongVarbinary { .. } => {
-            binary_buf.clear();
-            let has_value = row.get_binary(column_index, binary_buf).map_err(|err| {
-                dmdb_err(
-                    DmdbReason::Database,
-                    format!("read dmdb column {} failed: {err}", column.name),
-                )
-            })?;
-            if !has_value {
-                return Ok(RawColumnValue::Null);
-            }
-            Ok(RawColumnValue::Binary(binary_buf))
-        }
-        _ => {
-            text_buf.clear();
-            let has_value = row.get_text(column_index, text_buf).map_err(|err| {
-                dmdb_err(
-                    DmdbReason::Database,
-                    format!("read dmdb column {} failed: {err}", column.name),
-                )
-            })?;
-            if !has_value {
-                return Ok(RawColumnValue::Null);
-            }
-            let raw = std::str::from_utf8(text_buf).map_err(|err| {
-                dmdb_err(
-                    DmdbReason::Parse,
-                    format!("dmdb column {} is not valid utf-8: {err}", column.name),
-                )
-            })?;
-            Ok(RawColumnValue::Text(raw))
-        }
-    }
-}
-
-fn read_column_json_value(
-    row: &mut CursorRow<'_>,
-    column_index: u16,
-    column: &DmdbColumnMeta,
-    text_buf: &mut Vec<u8>,
-    binary_buf: &mut Vec<u8>,
-) -> DmdbResult<JsonValue> {
-    let raw = read_column_raw_value(row, column_index, column, text_buf, binary_buf)?;
-    Ok(parse_column_json_value(raw, column))
-}
-
-fn parse_column_json_value(raw: RawColumnValue<'_>, column: &DmdbColumnMeta) -> JsonValue {
-    let RawColumnValue::Text(raw) = raw else {
-        return match raw {
-            RawColumnValue::Null => JsonValue::Null,
-            RawColumnValue::Binary(bytes) => JsonValue::String(hex::encode_upper(bytes)),
-            RawColumnValue::Text(_) => unreachable!(),
-        };
-    };
-    if let Some(formatted) = normalize_temporal_json_text(raw, column) {
-        return JsonValue::String(formatted);
-    }
-    JsonValue::String(raw.to_string())
-}
-
-fn normalize_temporal_json_text(raw: &str, column: &DmdbColumnMeta) -> Option<String> {
-    let utc = FixedOffset::east_opt(0)?;
-    match &column.data_type {
-        DataType::Date => parse_date_fallback(raw, utc)
-            .ok()
-            .map(|date| date.format("%Y-%m-%d").to_string()),
-        DataType::Time { .. } => chrono::NaiveTime::parse_from_str(raw, "%H:%M:%S%.f")
-            .or_else(|_| chrono::NaiveTime::parse_from_str(raw, "%H:%M:%S"))
-            .ok()
-            .map(|time| time.format("%H:%M:%S%.6f").to_string()),
-        DataType::Timestamp { .. } => {
-            let type_name = column.type_name.to_ascii_uppercase();
-            if type_name.contains("WITH TIME ZONE") || type_name.contains("TIME ZONE") {
-                parse_timestamptz_fallback(raw, utc)
-                    .ok()
-                    .map(|datetime| datetime.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string())
-            } else {
-                parse_timestamp_fallback(raw, utc)
-                    .ok()
-                    .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
-            }
-        }
-        _ => None,
-    }
-}
-
 /// 根据时间列的真实类型推导 lower bound 绑定方式。
-fn time_lower_bound_binding(data_type: &DataType, type_name: &str) -> Option<LowerBoundBinding> {
+fn time_lower_bound_binding(
+    data_type: &DmdbDataType,
+    type_name: &str,
+) -> Option<LowerBoundBinding> {
     match data_type {
-        DataType::Date => Some(LowerBoundBinding::Date),
-        DataType::Timestamp { .. } => {
+        DmdbDataType::Date => Some(LowerBoundBinding::Date),
+        DmdbDataType::Timestamp { .. } => {
             let normalized = type_name.to_ascii_uppercase();
             if normalized.contains("WITH TIME ZONE") || normalized.contains("TIME ZONE") {
                 Some(LowerBoundBinding::TimestampTz)
@@ -1177,26 +1101,31 @@ fn time_lower_bound_binding(data_type: &DataType, type_name: &str) -> Option<Low
     }
 }
 
-fn is_integer_data_type(data_type: &DataType) -> bool {
+fn is_integer_data_type(data_type: &DmdbDataType) -> bool {
     matches!(
         data_type,
-        DataType::TinyInt | DataType::SmallInt | DataType::Integer | DataType::BigInt
+        DmdbDataType::TinyInt
+            | DmdbDataType::SmallInt
+            | DmdbDataType::Integer
+            | DmdbDataType::BigInt
     )
 }
 
-fn is_numeric_data_type(data_type: &DataType, type_name: &str) -> bool {
+fn is_numeric_data_type(data_type: &DmdbDataType, type_name: &str) -> bool {
     matches!(
         data_type,
-        DataType::Numeric { .. }
-            | DataType::Decimal { .. }
-            | DataType::Float { .. }
-            | DataType::Real
-            | DataType::Double
+        DmdbDataType::Numeric { .. }
+            | DmdbDataType::Decimal { .. }
+            | DmdbDataType::Float { .. }
+            | DmdbDataType::Real
+            | DmdbDataType::Double
     ) || matches!(
         type_name.to_ascii_uppercase().as_str(),
         "NUMBER" | "NUMERIC" | "DECIMAL" | "DOUBLE" | "FLOAT" | "REAL"
     )
 }
+
+// ===== checkpoint 与基础配置辅助 =====
 
 /// 校验 checkpoint 的游标信息是否仍与当前 Source 配置兼容。
 fn validate_checkpoint_state(
@@ -1305,6 +1234,8 @@ fn normalize_optional_start_from(
     raw.map(|raw| cursor_plan.normalize_start_from(raw, format, session_offset))
         .transpose()
 }
+
+// ===== start_from 解析与时间归一化 =====
 
 /// 归一化 DATE 游标的 `start_from` 输入。
 fn normalize_date_start_from(
@@ -1569,6 +1500,8 @@ fn pattern_has_time(pattern: &str) -> bool {
         || pattern.contains("%R")
 }
 
+// ===== 表引用与 schema 归一化 =====
+
 /// 归一化 schema 配置，空白值视为未设置。
 fn normalized_schema(schema: Option<&str>) -> Option<String> {
     schema
@@ -1585,6 +1518,8 @@ fn qualified_table_name(schema: Option<&str>, table: &str) -> String {
     }
 }
 
+// ===== 测试 =====
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1598,12 +1533,7 @@ mod tests {
         CursorPlan {
             cursor_type,
             lower_bound_binding,
-            payload_columns: vec![DmdbColumnMeta {
-                name: "name".into(),
-                type_name: "VARCHAR".into(),
-                data_type: DataType::Varchar { length: None },
-                ordinal_position: 1,
-            }],
+            payload_expr: "JSON_OBJECT('name' VALUE t.\"name\")".into(),
         }
     }
 
@@ -1656,6 +1586,7 @@ mod tests {
     fn build_batch_query_without_lower_bound_omits_where() {
         let sql = build_batch_query(
             "\"T_EVENTS\"",
+            "T_EVENTS",
             "id",
             None,
             100,
@@ -1663,34 +1594,38 @@ mod tests {
         );
         assert!(sql.contains("ORDER BY t.\"id\" ASC LIMIT 100"));
         assert!(!sql.contains("WHERE t.\"id\" >"));
-        assert!(sql.contains("SELECT t.*, t.\"id\" AS \"__warp_cursor_value\""));
-        assert!(!sql.contains("WITH base AS"));
+        assert!(sql.contains("WITH base AS (SELECT t.*, 'T_EVENTS' AS __warp_parse_table"));
+        assert!(
+            sql.contains("SELECT CAST(t.\"__warp_cursor_value\" AS VARCHAR(128)) AS cursor_value")
+        );
     }
 
     #[test]
     fn build_batch_query_with_lower_bound_contains_predicate() {
         let sql = build_batch_query(
             "\"T_EVENTS\"",
+            "T_EVENTS",
             "id",
             Some("42"),
             100,
             &test_cursor_plan(CursorType::Int, LowerBoundBinding::Integer),
         );
         assert!(sql.contains("WHERE t.\"id\" > 42"));
-        assert!(sql.contains("ORDER BY t.\"id\" ASC LIMIT 100"));
+        assert!(sql.contains("FROM base t ORDER BY t.\"__warp_cursor_value\" ASC"));
     }
 
     #[test]
     fn build_batch_query_outer_order_keeps_original_cursor_order() {
         let sql = build_batch_query(
             "\"T_EVENTS\"",
+            "T_EVENTS",
             "id",
             Some("42"),
             100,
             &test_cursor_plan(CursorType::Int, LowerBoundBinding::Integer),
         );
-        assert!(sql.contains("ORDER BY t.\"id\" ASC LIMIT 100"));
-        assert!(!sql.contains("WITH base AS"));
+        assert!(sql.contains("ORDER BY t.\"__warp_cursor_value\" ASC"));
+        assert!(!sql.contains("ORDER BY dmdb_source_batch.cursor_value ASC"));
     }
 
     #[test]
@@ -1751,118 +1686,25 @@ mod tests {
 
     #[test]
 
-    fn build_batch_query_uses_star_projection_for_payload_columns() {
-        let sql = build_batch_query(
-            "\"T_EVENTS\"",
-            "id",
-            None,
-            100,
-            &test_cursor_plan(CursorType::Int, LowerBoundBinding::Integer),
-        );
-        assert!(sql.contains("SELECT t.*, t.\"id\" AS \"__warp_cursor_value\""));
-        assert!(!sql.contains("WITH base AS"));
-    }
-
-    #[test]
-    fn parse_column_json_value_keeps_string_precision() {
-        let int_column = DmdbColumnMeta {
-            name: "id".into(),
-            type_name: "INTEGER".into(),
-            data_type: DataType::Integer,
-            ordinal_position: 1,
-        };
-        let decimal_column = DmdbColumnMeta {
-            name: "score".into(),
-            type_name: "DECIMAL".into(),
-            data_type: DataType::Decimal {
-                precision: 10,
-                scale: 2,
+    fn build_payload_expr_adds_table_field() {
+        let columns = vec![
+            DmdbColumnMeta {
+                name: "id".into(),
+                type_name: "INTEGER".into(),
+                data_type: DmdbDataType::Integer,
+                ordinal_position: 1,
             },
-            ordinal_position: 2,
-        };
-        let text_column = DmdbColumnMeta {
-            name: "name".into(),
-            type_name: "VARCHAR".into(),
-            data_type: DataType::Varchar { length: None },
-            ordinal_position: 3,
-        };
-        assert_eq!(
-            parse_column_json_value(RawColumnValue::Text("42"), &int_column),
-            JsonValue::String("42".into())
-        );
-        assert_eq!(
-            parse_column_json_value(RawColumnValue::Text("42.50"), &decimal_column),
-            JsonValue::String("42.50".into())
-        );
-        assert_eq!(
-            parse_column_json_value(RawColumnValue::Text("alice"), &text_column),
-            JsonValue::String("alice".into())
-        );
-        assert_eq!(
-            parse_column_json_value(RawColumnValue::Null, &text_column),
-            JsonValue::Null
-        );
-        assert_eq!(
-            parse_column_json_value(RawColumnValue::Binary(&[0x0A, 0xBC]), &text_column),
-            JsonValue::String("0ABC".into())
-        );
-    }
-
-    #[test]
-    fn encode_hex_matches_database_style() {
-        assert_eq!(hex::encode_upper([0x0A, 0xBC, 0x01]), "0ABC01");
-    }
-
-    #[test]
-    fn parse_column_json_value_normalizes_date_time_text() {
-        let date_column = DmdbColumnMeta {
-            name: "event_date".into(),
-            type_name: "DATE".into(),
-            data_type: DataType::Date,
-            ordinal_position: 1,
-        };
-        let time_column = DmdbColumnMeta {
-            name: "event_time".into(),
-            type_name: "TIME".into(),
-            data_type: DataType::Time { precision: 6 },
-            ordinal_position: 2,
-        };
-        let timestamp_column = DmdbColumnMeta {
-            name: "created_at".into(),
-            type_name: "TIMESTAMP".into(),
-            data_type: DataType::Timestamp { precision: 6 },
-            ordinal_position: 3,
-        };
-        let timestamptz_column = DmdbColumnMeta {
-            name: "created_at_tz".into(),
-            type_name: "TIMESTAMP WITH TIME ZONE".into(),
-            data_type: DataType::Timestamp { precision: 6 },
-            ordinal_position: 4,
-        };
-        assert_eq!(
-            parse_column_json_value(
-                RawColumnValue::Text("2026-05-11T08:09:10+08:00"),
-                &date_column
-            ),
-            JsonValue::String("2026-05-11".into())
-        );
-        assert_eq!(
-            parse_column_json_value(RawColumnValue::Text("08:09:10.123"), &time_column),
-            JsonValue::String("08:09:10.123000".into())
-        );
-        assert_eq!(
-            parse_column_json_value(
-                RawColumnValue::Text("2026-05-11T08:09:10.123+08:00"),
-                &timestamp_column
-            ),
-            JsonValue::String("2026-05-11 08:09:10.123000".into())
-        );
-        assert_eq!(
-            parse_column_json_value(
-                RawColumnValue::Text("2026-05-11 08:09:10.123"),
-                &timestamptz_column
-            ),
-            JsonValue::String("2026-05-11T08:09:10.123000+00:00".into())
-        );
+            DmdbColumnMeta {
+                name: "name".into(),
+                type_name: "VARCHAR".into(),
+                data_type: DmdbDataType::Varchar { length: None },
+                ordinal_position: 2,
+            },
+        ];
+        let expr = build_payload_expr(&columns).expect("build payload expr");
+        assert!(expr.contains("'id' VALUE t.\"id\""));
+        assert!(expr.contains("'name' VALUE t.\"name\""));
+        assert!(expr.contains("'warp_parse_table' VALUE t.__warp_parse_table"));
+        assert!(expr.contains("AS CLOB"));
     }
 }

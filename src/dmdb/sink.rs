@@ -1,8 +1,8 @@
 use super::common::{DmdbConnectionHandle, connect_shared, escape_sql_literal, quote_identifier};
 use super::config::DmdbSinkConf;
+use super::odbc_dyn::DynConn;
 use super::source::{DmdbReason, DmdbResult, dmdb_err};
 use async_trait::async_trait;
-use odbc_api::Connection;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
@@ -239,7 +239,7 @@ fn execute_statements_in_transaction(
     let result = (|| -> DmdbResult<()> {
         for statement in &statements {
             conn_guard
-                .execute(statement.as_str(), (), query_timeout_secs)
+                .execute(statement.as_str(), query_timeout_secs)
                 .map(|_| ())
                 .map_err(|err| {
                     dmdb_err(
@@ -274,7 +274,7 @@ fn execute_statements_in_transaction(
 /// 如果 rollback 自身失败，则保留 autocommit=false，避免在未知事务状态下继续提交。
 fn rollback_and_restore_autocommit(
     err: super::source::DmdbError,
-    connection: &Connection<'static>,
+    connection: &DynConn,
 ) -> DmdbResult<()> {
     connection.rollback().map_err(|rollback_err| {
         dmdb_err(

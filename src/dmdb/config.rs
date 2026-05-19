@@ -1,6 +1,6 @@
+use super::odbc_dyn::{self, ColumnOptions};
 use super::source::{DmdbReason, DmdbResult, dmdb_err};
 use educe::Educe;
-use odbc_api::{ConnectionOptions, escape_attribute_value};
 use serde::{Deserialize, Serialize};
 
 /// 达梦连接公共配置。
@@ -65,10 +65,9 @@ pub struct DmdbSinkConf {
 
 impl DmdbConnConf {
     /// 将仓库统一配置映射为 ODBC 建连选项。
-    pub fn connect_options(&self) -> ConnectionOptions {
-        ConnectionOptions {
+    pub(crate) fn connect_options(&self) -> ColumnOptions {
+        ColumnOptions {
             login_timeout_sec: self.connect_timeout_secs.map(|secs| secs as u32),
-            packet_size: None,
         }
     }
 
@@ -110,8 +109,8 @@ impl DmdbConnConf {
     /// 用户名和密码会做 ODBC 属性值转义，避免特殊字符破坏连接串结构。
     pub(crate) fn generated_connection_string(&self) -> DmdbResult<String> {
         let (host, port) = self.endpoint_parts()?;
-        let username = escape_attribute_value(self.username.trim());
-        let password = escape_attribute_value(self.password.as_str());
+        let username = odbc_dyn::escape_attr_value(self.username.trim());
+        let password = odbc_dyn::escape_attr_value(self.password.as_str());
 
         let mut parts = vec![
             format!("Driver={{{}}}", self.driver.trim()),

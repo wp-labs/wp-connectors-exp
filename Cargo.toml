@@ -1,6 +1,6 @@
 [package]
 name = "wp-connectors-labs"
-version = "0.1.4" #@gxl:set(version)
+version = "0.1.5" #@gxl:set(version)
 edition = "2024"
 description = "Experimental connectors for warp-parse: dmdb"
 authors = ["WP Labs Team"]
@@ -9,7 +9,7 @@ repository = "https://github.com/wp-labs/wp-connectors"
 
 [features]
 default = ["dmdb"]
-dmdb = ["dep:odbc-api"]
+dmdb = []
 
 [dependencies]
 wp-connector-api = "0.10"
@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 educe = { version = "0.6", default-features = false, features = ["Debug", "Default"] }
 bytes = "1"
-odbc-api = { version = "24.1", default-features = false, features = ["odbc_version_3_5"], optional = true }
+libloading = "0.8"
 thiserror = "2"
 hex = "0.4"
 

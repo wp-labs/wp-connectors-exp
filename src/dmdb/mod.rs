@@ -10,6 +10,7 @@
 mod common;
 mod config;
 mod factory;
+mod odbc_dyn;
 mod sink;
 mod source;
 

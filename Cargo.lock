@@ -2512,7 +2512,21 @@ dependencies = [
  "wp-conf-base",
  "wp-connector-api",
  "wp-connector-test-utils",
+ "wp-data-fmt",
  "wp-log",
+ "wp-model-core",
+]
+
+[[package]]
+name = "wp-data-fmt"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa95e159e9214f5cc4d7895996515d48a0987e163e9387cb191bc3489bd2aba3"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
  "wp-model-core",
 ]
 

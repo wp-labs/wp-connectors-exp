@@ -8,14 +8,16 @@ license = "Apache-2.0"
 repository = "https://github.com/wp-labs/wp-connectors"
 
 [features]
-default = ["dmdb"]
+default = ["dmdb", "udp"]
 dmdb = []
+udp = ["wp-data-fmt"]
 
 [dependencies]
 wp-connector-api = "0.10"
 wp-model-core = "0.8"
 wp-log = "0.4"
 wp-conf-base = "0.4"
+wp-data-fmt = { version = "0.2", optional = true }
 orion-error = "0.8"
 orion_conf = { version = "0.7", features = ["yaml", "toml"] }
 

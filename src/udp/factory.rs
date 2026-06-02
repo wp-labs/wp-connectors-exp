@@ -11,18 +11,16 @@ use wp_connector_api::{
 pub struct UdpSinkSpec {
     pub addr: String,
     pub port: u16,
+    pub send_buffer_size: usize,
 }
 
 impl UdpSinkSpec {
     pub fn from_params(params: &ParamMap) -> SinkResult<Self> {
-        let addr = params
-            .get("addr")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                SinkReason::core_conf()
-                    .to_err()
-                    .with_detail("udp.addr must be a string")
-            })?;
+        let addr = params.get("addr").and_then(|v| v.as_str()).ok_or_else(|| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail("udp.addr must be a string")
+        })?;
         if let Some(i) = params.get("port").and_then(|v| v.as_i64())
             && !(1..=65535).contains(&i)
         {
@@ -30,13 +28,15 @@ impl UdpSinkSpec {
                 .to_err()
                 .with_detail("udp.port must be in 1..=65535"));
         }
-        let port = params
-            .get("port")
+        let port = params.get("port").and_then(|v| v.as_i64()).unwrap_or(514) as u16;
+        let send_buffer_size = params
+            .get("send_buffer_size")
             .and_then(|v| v.as_i64())
-            .unwrap_or(514) as u16;
+            .unwrap_or(65536) as usize;
         Ok(Self {
             addr: addr.to_string(),
             port,
+            send_buffer_size,
         })
     }
 
@@ -72,11 +72,12 @@ impl SinkDefProvider for UdpSinkFactory {
         let mut params = ParamMap::new();
         params.insert("addr".into(), json!("127.0.0.1"));
         params.insert("port".into(), json!(514));
+        params.insert("send_buffer_size".into(), json!(65536));
         ConnectorDef {
             id: "udp_sink".into(),
             kind: self.kind().into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["addr".into(), "port".into()],
+            allow_override: vec!["addr".into(), "port".into(), "send_buffer_size".into()],
             default_params: params,
             origin: Some("wp-connectors-labs:udp_sink".into()),
         }
@@ -97,8 +98,7 @@ mod tests {
 
     #[test]
     fn udp_conf_defaults_to_port_514() {
-        let conf =
-            UdpSinkSpec::from_params(&mk_params(&[("addr", json!("192.168.1.1"))])).unwrap();
+        let conf = UdpSinkSpec::from_params(&mk_params(&[("addr", json!("192.168.1.1"))])).unwrap();
         assert_eq!(conf.addr, "192.168.1.1");
         assert_eq!(conf.port, 514);
     }

@@ -1,9 +1,7 @@
 use super::factory::UdpSinkSpec;
 use async_trait::async_trait;
 use orion_error::conversion::SourceErr;
-use wp_connector_api::{
-    AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, SinkReason, SinkResult,
-};
+use wp_connector_api::{AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, SinkReason, SinkResult};
 use wp_data_fmt::RecordFormatter;
 
 pub struct UdpSink {
@@ -18,6 +16,9 @@ impl UdpSink {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
             .await
             .source_err(SinkReason::Sink, "udp sink bind")?;
+        socket2::SockRef::from(&socket)
+            .set_send_buffer_size(spec.send_buffer_size)
+            .source_err(SinkReason::Sink, "udp sink set send buffer")?;
         socket
             .connect(&target)
             .await

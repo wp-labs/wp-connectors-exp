@@ -2507,6 +2507,7 @@ dependencies = [
  "quickcheck_macros",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror",
  "tokio",
  "wp-conf-base",

@@ -125,6 +125,7 @@ const SQL_FETCH_NEXT: SqlSmallInt = 1; // 取下一行
 
 // --- SQLGetData 目标类型 ---
 const SQL_C_CHAR: SqlSmallInt = 1; // 以 C 字符串（char*）读取
+const SQL_C_BINARY: SqlSmallInt = -2; // 以二进制（BYTE*）读取
 
 // ===========================================================================
 // ODBC 函数指针类型定义
@@ -1087,6 +1088,10 @@ impl DynCursorRow<'_> {
     /// 调用 `buf.clear()`．这允许复用同一缓冲区。
     pub(crate) fn get_text(&self, col: u16, buf: &mut Vec<u8>) -> Result<bool, String> {
         self.read_column(col, SQL_C_CHAR, buf)
+    }
+
+    pub(crate) fn get_binary(&self, col: u16, buf: &mut Vec<u8>) -> Result<bool, String> {
+        self.read_column(col, SQL_C_BINARY, buf)
     }
 
     /// ODBC `SQLGetData` 的通用封装，支持分块读取．

@@ -1,9 +1,8 @@
 use super::common::connect_shared;
 use super::config::{DmdbConnConf, DmdbSinkConf, DmdbSourceConf};
+use super::error::{DmdbReason, DmdbResult, dmdb_err};
 use super::sink::DmdbSink;
-use super::source::{
-    DmdbReason, DmdbResult, DmdbSource, dmdb_err, validate_source_cursor_type_and_start_from,
-};
+use super::source::{DmdbSource, validate_source_cursor_type_and_start_from};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use wp_conf_base::ConfParser;

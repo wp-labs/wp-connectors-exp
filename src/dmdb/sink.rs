@@ -1,7 +1,7 @@
 use super::common::{DmdbConnectionHandle, connect_shared, escape_sql_literal, quote_identifier};
 use super::config::DmdbSinkConf;
+use super::error::{DmdbError, DmdbReason, DmdbResult, dmdb_err};
 use super::odbc_dyn::DynConn;
-use super::source::{DmdbReason, DmdbResult, dmdb_err};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -272,10 +272,7 @@ fn execute_statements_in_transaction(
 
 /// 回滚事务并恢复自动提交模式。
 /// 如果 rollback 自身失败，则保留 autocommit=false，避免在未知事务状态下继续提交。
-fn rollback_and_restore_autocommit(
-    err: super::source::DmdbError,
-    connection: &DynConn,
-) -> DmdbResult<()> {
+fn rollback_and_restore_autocommit(err: DmdbError, connection: &DynConn) -> DmdbResult<()> {
     connection.rollback().map_err(|rollback_err| {
         dmdb_err(
             DmdbReason::Database,

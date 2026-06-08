@@ -9,6 +9,7 @@
 
 mod common;
 mod config;
+pub(crate) mod error;
 mod factory;
 mod odbc_dyn;
 mod sink;

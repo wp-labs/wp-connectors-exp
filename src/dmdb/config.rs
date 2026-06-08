@@ -1,5 +1,5 @@
+use super::error::{DmdbReason, DmdbResult, dmdb_err};
 use super::odbc_dyn::{self, ColumnOptions};
-use super::source::{DmdbReason, DmdbResult, dmdb_err};
 use educe::Educe;
 use serde::{Deserialize, Serialize};
 

@@ -1099,21 +1099,20 @@ impl DynCursorRow<'_> {
     /// ## 读取策略
     ///
     /// ODBC 的长数据（如 CLOB、BLOB）可能需要多次 `SQLGetData` 调用才能完整读取．
-    /// 我们采用"先探测长度，再分配读取"的策略：
     ///
-    /// 1. 第一次调用传 NULL buffer，获取实际数据长度（`len_or_ind`）
-    /// 2. 如果 `len_or_ind == SQL_NULL_DATA` → 列值为 NULL，返回 `Ok(false)`
-    /// 3. 扩容 `buf` 到 offset + needed
-    /// 4. 第二次调用传实际 buffer，读取数据
-    /// 5. 如果第二次调用返回 `SQL_SUCCESS_WITH_INFO` 且数据被截断 →
-    ///    说明 buffer 不够大，扩到更大并重试
+    /// 注意：不使用 NULL buffer 探测长度，因为部分 ODBC Driver Manager
+    /// （如 unixODBC）会拒绝 `TargetValuePtr = NULL` 并返回 HY009，
+    /// 即便 `BufferLength = 0` 在规范中是合法的．
+    ///
+    /// 改为直接从较小的 buffer 开始读取，如果数据被截断则循环追加后续分块，
+    /// 直到 `SQL_SUCCESS`．
     ///
     /// ## 关于 `unsafe`
     ///
     /// `buf.set_len()` 是不安全的，因为我们直接写入 Vec 的未初始化空间．
     /// 这是必要的——ODBC 驱动需要直接写入我们提供的内存．我们用以下保证：
-    /// - `vec.reserve()` 先确保容量足够
-    /// - 写入后根据 `actual` 截断到实际数据长度
+    /// - `vec.resize()` 先确保容量足够
+    /// - 写入后根据 ODBC 报告的长度截断到实际数据长度
     /// - 如果出错，恢复 `buf` 到 `offset`（操作前的长度）
     fn read_column(
         &self,
@@ -1122,109 +1121,70 @@ impl DynCursorRow<'_> {
         buf: &mut Vec<u8>,
     ) -> Result<bool, String> {
         let f = funcs()?;
-
-        // Step 1: 探测长度（传 NULL buffer）
-        let mut len_or_ind: SqlLen = 0;
-        let ret = unsafe {
-            (f.sql_get_data)(
-                self.stmt(),
-                col as SqlUSmallInt,
-                target_type,
-                ptr::null_mut(), // NULL —— 只获取长度
-                0,
-                &mut len_or_ind, // 输出：实际长度或 SQL_NULL_DATA
-            )
-        };
-        if ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO {
-            return Err(odbc_err(format!(
-                "SQLGetData(len) col {col} failed: {ret}{}",
-                odbc_diag(SQL_HANDLE_STMT, self.stmt())
-            )));
-        }
-
-        // NULL 值
-        if len_or_ind == SQL_NULL_DATA {
-            return Ok(false);
-        }
-
-        // 空字符串 / 零长度数据
-        if len_or_ind == 0 {
-            buf.clear();
-            return Ok(true);
-        }
-
-        // Step 2: 计算需要的缓冲区大小
-        let needed = if len_or_ind < 0 {
-            // len_or_ind 为负数表示驱动无法确定长度（如流式数据），
-            // 先分配 256 字节试探
-            256
-        } else {
-            // 需要多分配 1 字节给 null terminator
-            len_or_ind as usize + 1
-        };
-
         let offset = buf.len();
-        buf.resize(offset + needed, 0);
 
-        // Step 3: 实际读取数据
-        let mut actual: SqlLen = 0;
-        let ret = unsafe {
-            (f.sql_get_data)(
-                self.stmt(),
-                col as SqlUSmallInt,
-                target_type,
-                buf.as_mut_ptr().add(offset) as SqlPointer,
-                needed as SqlLen,
-                &mut actual,
-            )
-        };
+        // Chunk size for each SQLGetData call. Balances syscall overhead
+        // vs. memory waste on small values.
+        const CHUNK: usize = 8192;
 
-        if ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO {
-            // Step 4: 缓冲区不够大？检查是否可以重试
-            if ret == SQL_SUCCESS_WITH_INFO || actual > needed as SqlLen {
-                // 扩到驱动报告的大小（至少 4096），然后重试
-                let bigger = actual.max(4096) as usize + 1;
-                buf.resize(offset + bigger, 0);
-                let ret2 = unsafe {
-                    (f.sql_get_data)(
-                        self.stmt(),
-                        col as SqlUSmallInt,
-                        target_type,
-                        buf.as_mut_ptr().add(offset) as SqlPointer,
-                        bigger as SqlLen,
-                        &mut actual,
-                    )
-                };
-                if ret2 != SQL_SUCCESS && ret2 != SQL_SUCCESS_WITH_INFO {
-                    // 重试也失败了 → 恢复 buf 并报错
-                    unsafe { buf.set_len(offset) };
-                    return Err(odbc_err(format!(
-                        "SQLGetData(retry) col {col} failed: {ret2}{}",
-                        odbc_diag(SQL_HANDLE_STMT, self.stmt())
-                    )));
-                }
-            } else {
-                // 非截断错误 → 恢复 buf 并报错
+        loop {
+            let pos = buf.len();
+            buf.resize(pos + CHUNK, 0);
+
+            let mut len_or_ind: SqlLen = 0;
+            let ret = unsafe {
+                (f.sql_get_data)(
+                    self.stmt(),
+                    col as SqlUSmallInt,
+                    target_type,
+                    buf.as_mut_ptr().add(pos) as SqlPointer,
+                    CHUNK as SqlLen,
+                    &mut len_or_ind,
+                )
+            };
+
+            if ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO {
                 unsafe { buf.set_len(offset) };
                 return Err(odbc_err(format!(
                     "SQLGetData col {col} failed: {ret}{}",
                     odbc_diag(SQL_HANDLE_STMT, self.stmt())
                 )));
             }
-        }
 
-        // Step 5: 将 buf 截断到实际数据长度
-        let data_len = if actual < 0 {
-            // 驱动未报告精确长度，用 needed（减 1 去 null terminator）
-            needed - 1
-        } else {
-            actual as usize
-        };
-        unsafe {
-            buf.set_len(offset + data_len);
-        }
+            // NULL check on first chunk only
+            if pos == offset && len_or_ind == SQL_NULL_DATA {
+                unsafe { buf.set_len(offset) };
+                return Ok(false);
+            }
 
-        Ok(true)
+            // For character types the driver reserves one byte for the
+            // null terminator within the buffer.
+            let max_data = if target_type == SQL_C_CHAR {
+                CHUNK - 1
+            } else {
+                CHUNK
+            };
+
+            let chunk_len = if len_or_ind == SQL_NULL_DATA || len_or_ind < 0 {
+                // Unknown total length. For final chunk of char data,
+                // locate the null terminator byte.
+                if ret == SQL_SUCCESS && target_type == SQL_C_CHAR {
+                    let written = &buf[pos..];
+                    written.iter().position(|&b| b == 0).unwrap_or(max_data)
+                } else {
+                    max_data
+                }
+            } else {
+                (len_or_ind as usize).min(max_data)
+            };
+
+            unsafe { buf.set_len(pos + chunk_len) };
+
+            if ret == SQL_SUCCESS {
+                return Ok(true);
+            }
+            // SQL_SUCCESS_WITH_INFO: more data available, continue loop
+        }
     }
 }
 

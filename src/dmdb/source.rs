@@ -6,6 +6,7 @@ use super::error::{DmdbReason, DmdbResult, dmdb_err};
 use super::odbc_dyn::{DmdbDataType, DynCursorRow};
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
+use encoding_rs::GBK;
 use orion_error::conversion::{SourceErr, SourceRawErr};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -974,6 +975,7 @@ fn build_payload_json(
 enum RawColumnValue<'a> {
     Null,
     Text(&'a str),
+    OwnedText(String),
     Binary(&'a [u8]),
 }
 
@@ -1011,29 +1013,36 @@ fn read_column_raw_value<'a>(
             if !has_value {
                 return Ok(RawColumnValue::Null);
             }
-            let raw = std::str::from_utf8(text_buf).map_err(|err| {
-                dmdb_err(
-                    DmdbReason::Parse,
-                    format!("dmdb column {} is not valid utf-8: {err}", column.name),
-                )
-            })?;
-            Ok(RawColumnValue::Text(raw))
+            match std::str::from_utf8(text_buf) {
+                Ok(raw) => Ok(RawColumnValue::Text(raw)),
+                Err(err) => {
+                    // 达梦库常见部署（如 `UNICODE_FLAG=0`）会返回本地编码文本；
+                    // payload 列按 UTF-8 失败时退回到 GBK/GB18030 兼容解码，避免整批中断。
+                    let (decoded, _, had_errors) = GBK.decode(text_buf);
+                    warn_data!(
+                        "[dmdb-source] column={} contains non-utf8 text, fallback decode via GBK/GB18030 (had_errors={}, utf8_err={})",
+                        column.name,
+                        had_errors,
+                        err
+                    );
+                    Ok(RawColumnValue::OwnedText(decoded.into_owned()))
+                }
+            }
         }
     }
 }
 
 fn parse_column_json_value(raw: RawColumnValue<'_>, column: &DmdbColumnMeta) -> JsonValue {
-    let RawColumnValue::Text(raw) = raw else {
-        return match raw {
-            RawColumnValue::Null => JsonValue::Null,
-            RawColumnValue::Binary(bytes) => JsonValue::String(hex::encode_upper(bytes)),
-            RawColumnValue::Text(_) => unreachable!(),
-        };
+    let raw_text = match raw {
+        RawColumnValue::Text(raw) => raw,
+        RawColumnValue::OwnedText(ref raw) => raw.as_str(),
+        RawColumnValue::Null => return JsonValue::Null,
+        RawColumnValue::Binary(bytes) => return JsonValue::String(hex::encode_upper(bytes)),
     };
-    if let Some(formatted) = format_date_time_value(raw, column) {
+    if let Some(formatted) = format_date_time_value(raw_text, column) {
         return JsonValue::String(formatted);
     }
-    JsonValue::String(raw.to_string())
+    JsonValue::String(raw_text.to_string())
 }
 
 fn format_date_time_value(raw: &str, column: &DmdbColumnMeta) -> Option<String> {

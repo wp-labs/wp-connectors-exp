@@ -126,6 +126,7 @@ const SQL_FETCH_NEXT: SqlSmallInt = 1; // 取下一行
 // --- SQLGetData 目标类型 ---
 const SQL_C_CHAR: SqlSmallInt = 1; // 以 C 字符串（char*）读取
 const SQL_C_BINARY: SqlSmallInt = -2; // 以二进制（BYTE*）读取
+const SQL_C_WCHAR: SqlSmallInt = -8; // 以宽字符串（wchar_t*）读取，由 unixODBC 负责编码转换
 
 // ===========================================================================
 // ODBC 函数指针类型定义
@@ -1092,6 +1093,75 @@ impl DynCursorRow<'_> {
 
     pub(crate) fn get_binary(&self, col: u16, buf: &mut Vec<u8>) -> Result<bool, String> {
         self.read_column(col, SQL_C_BINARY, buf)
+    }
+
+    /// 以宽字符方式读取列（`SQL_C_WCHAR`），由 unixODBC 驱动管理器负责将
+    /// 数据库编码自动转换为 UTF-16LE，再转为 UTF-8 字符串返回。
+    pub(crate) fn get_text_wide(&self, col: u16) -> Result<Option<String>, String> {
+        let f = funcs()?;
+        let mut buf: Vec<u8> = Vec::new();
+        const CHUNK: usize = 8192;
+
+        loop {
+            let pos = buf.len();
+            buf.resize(pos + CHUNK, 0);
+
+            let mut len_or_ind: SqlLen = 0;
+            let ret = unsafe {
+                (f.sql_get_data)(
+                    self.stmt(),
+                    col as SqlUSmallInt,
+                    SQL_C_WCHAR,
+                    buf.as_mut_ptr().add(pos) as SqlPointer,
+                    CHUNK as SqlLen,
+                    &mut len_or_ind,
+                )
+            };
+
+            if ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO {
+                return Err(odbc_err(format!(
+                    "SQLGetData col {col} (wide) failed: {ret}{}",
+                    odbc_diag(SQL_HANDLE_STMT, self.stmt())
+                )));
+            }
+
+            if pos == 0 && len_or_ind == SQL_NULL_DATA {
+                return Ok(None);
+            }
+
+            let chunk_len = if len_or_ind == SQL_NULL_DATA || len_or_ind < 0 {
+                if ret == SQL_SUCCESS {
+                    let written = &buf[pos..];
+                    written
+                        .chunks(2)
+                        .position(|c| c == [0, 0])
+                        .map(|p| p * 2)
+                        .unwrap_or(CHUNK - 2)
+                } else {
+                    CHUNK - 2
+                }
+            } else {
+                (len_or_ind as usize).min(CHUNK - 2)
+            };
+
+            unsafe { buf.set_len(pos + chunk_len) };
+
+            if ret == SQL_SUCCESS {
+                break;
+            }
+        }
+
+        if buf.is_empty() {
+            return Ok(Some(String::new()));
+        }
+
+        let u16_slice: &[u16] = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const u16, buf.len() / 2)
+        };
+
+        String::from_utf16(u16_slice)
+            .map(Some)
+            .map_err(|e| odbc_err(format!("UTF-16 decode failed: {e:?}")))
     }
 
     /// ODBC `SQLGetData` 的通用封装，支持分块读取．

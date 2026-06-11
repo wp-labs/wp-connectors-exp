@@ -6,7 +6,6 @@ use super::error::{DmdbReason, DmdbResult, dmdb_err};
 use super::odbc_dyn::{DmdbDataType, DynCursorRow};
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
-use encoding_rs::GBK;
 use orion_error::conversion::{SourceErr, SourceRawErr};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -197,7 +196,7 @@ impl DmdbSource {
                 .filter(|value| !value.is_empty())
                 .unwrap_or("int"),
         )
-        .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+        .source_err(SourceReason::Other, "invalid dmdb cursor_type")?;
 
         // 建连走阻塞线程，避免 ODBC 调用卡住 Tokio runtime。
         let connection = {
@@ -206,9 +205,9 @@ impl DmdbSource {
                 .await
                 .source_raw_err(
                     SourceReason::Other,
-                    "initialize dmdb source failed: spawn connect task failed",
+                    "spawn dmdb connect task failed",
                 )?
-                .source_err(SourceReason::Other, "initialize dmdb source failed")?
+                .source_err(SourceReason::Other, "connect to dmdb failed")?
         };
 
         let schema = normalized_schema(config.conn.schema.as_deref());
@@ -230,14 +229,14 @@ impl DmdbSource {
             .await
             .source_raw_err(
                 SourceReason::Other,
-                "initialize dmdb source failed: spawn cursor plan task failed",
+                "spawn dmdb cursor plan task failed",
             )?
-            .source_err(SourceReason::Other, "initialize dmdb source failed")?
+            .source_err(SourceReason::Other, "build dmdb cursor plan failed")?
         };
 
         let start_from_format =
             parse_start_from_format(config.start_from_format.as_deref(), cursor_type)
-                .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+                .source_err(SourceReason::Other, "parse dmdb start_from_format failed")?;
         let session_offset = FixedOffset::east_opt(0)
             .ok_or_else(|| SourceReason::other("build UTC fixed offset failed"))?;
         // `start_from` 会先标准化为数据库可稳定比较的文本形式。
@@ -247,7 +246,7 @@ impl DmdbSource {
             start_from_format.as_ref(),
             session_offset,
         )
-        .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+        .source_err(SourceReason::Other, "normalize dmdb start_from failed")?;
 
         let batch = config.batch.unwrap_or(DEFAULT_BATCH).max(1);
         let poll_interval =
@@ -258,12 +257,12 @@ impl DmdbSource {
         let table_ref = qualified_table_name(schema.as_deref(), table);
         let checkpoint_path = checkpoint_path(&key);
         let checkpoint = Self::load_checkpoint(&checkpoint_path, cursor_column, &cursor_plan)
-            .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+            .source_err(SourceReason::Other, "load dmdb checkpoint failed")?;
         // checkpoint 优先于 start_from，避免 Source 重启后重复回到初始位点。
         if let Some(lower_bound) = resolve_lower_bound(checkpoint.as_ref(), start_from.as_deref()) {
             cursor_plan
                 .validate_lower_bound(lower_bound, "dmdb active lower bound")
-                .source_err(SourceReason::Other, "initialize dmdb source failed")?;
+                .source_err(SourceReason::Other, "validate dmdb lower bound failed")?;
         }
 
         info_data!(
@@ -710,7 +709,7 @@ fn query_next_batch_blocking(
 ) -> DmdbResult<Vec<(String, String)>> {
     let conn_guard = connection
         .lock()
-        .map_err(|_| dmdb_err(DmdbReason::Database, "lock dmdb source connection fail"))?;
+        .map_err(|_| dmdb_err(DmdbReason::Database, "lock dmdb source connection failed"))?;
     let Some(mut cursor) = conn_guard
         .execute(sql.as_str(), query_timeout_secs)
         .map_err(|err| {
@@ -974,7 +973,6 @@ fn build_payload_json(
 
 enum RawColumnValue<'a> {
     Null,
-    Text(&'a str),
     OwnedText(String),
     Binary(&'a [u8]),
 }
@@ -983,7 +981,7 @@ fn read_column_raw_value<'a>(
     row: &mut DynCursorRow<'_>,
     column_index: u16,
     column: &DmdbColumnMeta,
-    text_buf: &'a mut Vec<u8>,
+    _text_buf: &'a mut Vec<u8>,
     binary_buf: &'a mut Vec<u8>,
 ) -> DmdbResult<RawColumnValue<'a>> {
     match &column.data_type {
@@ -1002,39 +1000,20 @@ fn read_column_raw_value<'a>(
             }
             Ok(RawColumnValue::Binary(binary_buf))
         }
-        _ => {
-            text_buf.clear();
-            let has_value = row.get_text(column_index, text_buf).map_err(|err| {
-                dmdb_err(
-                    DmdbReason::Database,
-                    format!("read dmdb column {} failed: {err}", column.name),
-                )
-            })?;
-            if !has_value {
-                return Ok(RawColumnValue::Null);
-            }
-            match std::str::from_utf8(text_buf) {
-                Ok(raw) => Ok(RawColumnValue::Text(raw)),
-                Err(err) => {
-                    // 达梦库常见部署（如 `UNICODE_FLAG=0`）会返回本地编码文本；
-                    // payload 列按 UTF-8 失败时退回到 GBK/GB18030 兼容解码，避免整批中断。
-                    let (decoded, _, had_errors) = GBK.decode(text_buf);
-                    warn_data!(
-                        "[dmdb-source] column={} contains non-utf8 text, fallback decode via GBK/GB18030 (had_errors={}, utf8_err={})",
-                        column.name,
-                        had_errors,
-                        err
-                    );
-                    Ok(RawColumnValue::OwnedText(decoded.into_owned()))
-                }
-            }
-        }
+        _ => match row.get_text_wide(column_index).map_err(|err| {
+            dmdb_err(
+                DmdbReason::Database,
+                format!("read dmdb column {} failed: {err}", column.name),
+            )
+        })? {
+            Some(text) => Ok(RawColumnValue::OwnedText(text)),
+            None => Ok(RawColumnValue::Null),
+        },
     }
 }
 
 fn parse_column_json_value(raw: RawColumnValue<'_>, column: &DmdbColumnMeta) -> JsonValue {
     let raw_text = match raw {
-        RawColumnValue::Text(raw) => raw,
         RawColumnValue::OwnedText(ref raw) => raw.as_str(),
         RawColumnValue::Null => return JsonValue::Null,
         RawColumnValue::Binary(bytes) => return JsonValue::String(hex::encode_upper(bytes)),
@@ -1749,15 +1728,15 @@ mod tests {
             ordinal_position: 3,
         };
         assert_eq!(
-            parse_column_json_value(RawColumnValue::Text("42"), &int_column),
+            parse_column_json_value(RawColumnValue::OwnedText("42".to_string()), &int_column),
             JsonValue::String("42".into())
         );
         assert_eq!(
-            parse_column_json_value(RawColumnValue::Text("42.50"), &decimal_column),
+            parse_column_json_value(RawColumnValue::OwnedText("42.50".into()), &decimal_column),
             JsonValue::String("42.50".into())
         );
         assert_eq!(
-            parse_column_json_value(RawColumnValue::Text("alice"), &text_column),
+            parse_column_json_value(RawColumnValue::OwnedText("alice".into()), &text_column),
             JsonValue::String("alice".into())
         );
         assert_eq!(
@@ -1803,25 +1782,25 @@ mod tests {
         };
         assert_eq!(
             parse_column_json_value(
-                RawColumnValue::Text("2026-05-11T08:09:10+08:00"),
+                RawColumnValue::OwnedText("2026-05-11T08:09:10+08:00".into()),
                 &date_column
             ),
             JsonValue::String("2026-05-11".into())
         );
         assert_eq!(
-            parse_column_json_value(RawColumnValue::Text("08:09:10.123"), &time_column),
+            parse_column_json_value(RawColumnValue::OwnedText("08:09:10.123".into()), &time_column),
             JsonValue::String("08:09:10.123000".into())
         );
         assert_eq!(
             parse_column_json_value(
-                RawColumnValue::Text("2026-05-11T08:09:10.123+08:00"),
+                RawColumnValue::OwnedText("2026-05-11T08:09:10.123+08:00".into()),
                 &timestamp_column
             ),
             JsonValue::String("2026-05-11 08:09:10.123000".into())
         );
         assert_eq!(
             parse_column_json_value(
-                RawColumnValue::Text("2026-05-11 08:09:10.123"),
+                RawColumnValue::OwnedText("2026-05-11 08:09:10.123".into()),
                 &timestamptz_column
             ),
             JsonValue::String("2026-05-11T08:09:10.123000+00:00".into())

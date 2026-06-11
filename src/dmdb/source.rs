@@ -203,10 +203,7 @@ impl DmdbSource {
             let conf = config.conn.clone();
             task::spawn_blocking(move || connect_shared_blocking(&conf))
                 .await
-                .source_raw_err(
-                    SourceReason::Other,
-                    "spawn dmdb connect task failed",
-                )?
+                .source_raw_err(SourceReason::Other, "spawn dmdb connect task failed")?
                 .source_err(SourceReason::Other, "connect to dmdb failed")?
         };
 
@@ -227,10 +224,7 @@ impl DmdbSource {
                 )
             })
             .await
-            .source_raw_err(
-                SourceReason::Other,
-                "spawn dmdb cursor plan task failed",
-            )?
+            .source_raw_err(SourceReason::Other, "spawn dmdb cursor plan task failed")?
             .source_err(SourceReason::Other, "build dmdb cursor plan failed")?
         };
 
@@ -1788,7 +1782,10 @@ mod tests {
             JsonValue::String("2026-05-11".into())
         );
         assert_eq!(
-            parse_column_json_value(RawColumnValue::OwnedText("08:09:10.123".into()), &time_column),
+            parse_column_json_value(
+                RawColumnValue::OwnedText("08:09:10.123".into()),
+                &time_column
+            ),
             JsonValue::String("08:09:10.123000".into())
         );
         assert_eq!(

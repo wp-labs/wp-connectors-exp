@@ -1155,9 +1155,8 @@ impl DynCursorRow<'_> {
             return Ok(Some(String::new()));
         }
 
-        let u16_slice: &[u16] = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u16, buf.len() / 2)
-        };
+        let u16_slice: &[u16] =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u16, buf.len() / 2) };
 
         String::from_utf16(u16_slice)
             .map(Some)

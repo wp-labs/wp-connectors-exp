@@ -2447,7 +2447,7 @@ dependencies = [
  "serde",
  "toml",
  "winnow",
- "wp-connector-api",
+ "wp-connector-api 0.10.1",
  "wp-model-core",
 ]
 
@@ -2471,6 +2471,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "wp-connector-api"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89a3690372dd54afccbe7d3cb8f4809ecca80c9510c93682f9acbba09b0fb6dc"
+dependencies = [
+ "async-broadcast",
+ "async-trait",
+ "derive_more",
+ "orion-error",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "smallvec",
+ "smol_str",
+ "toml",
+ "wp-model-core",
+ "wp-source-types",
+]
+
+[[package]]
 name = "wp-connector-test-utils"
 version = "0.2.0"
 source = "git+https://github.com/wp-labs/wp-connector-test-utils.git#0e86150b41809716c57b045a22e1ba8f3ada1eb5"
@@ -2485,7 +2505,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "tokio",
- "wp-connector-api",
+ "wp-connector-api 0.10.1",
  "wp-model-core",
 ]
 
@@ -2511,7 +2531,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "wp-conf-base",
- "wp-connector-api",
+ "wp-connector-api 0.11.2",
  "wp-connector-test-utils",
  "wp-data-fmt",
  "wp-log",
@@ -2566,6 +2586,18 @@ dependencies = [
  "serde_derive",
  "smol_str",
  "thiserror",
+]
+
+[[package]]
+name = "wp-source-types"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c146480ccaeedaa5340f60dcb0a5b7a3b2e77c9c30b0c8e0f6ef5acfaa9e9e68"
+dependencies = [
+ "serde",
+ "smallvec",
+ "smol_str",
+ "wp-model-core",
 ]
 
 [[package]]

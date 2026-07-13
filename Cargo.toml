@@ -13,7 +13,7 @@ dmdb = []
 udp = ["wp-data-fmt"]
 
 [dependencies]
-wp-connector-api = "0.10"
+wp-connector-api = "0.11"
 wp-model-core = "0.8"
 wp-log = "0.4"
 wp-conf-base = "0.4"

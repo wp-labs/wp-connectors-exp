@@ -13,11 +13,11 @@ dmdb = []
 udp = ["wp-data-fmt"]
 
 [dependencies]
-wp-connector-api = "0.11"
-wp-model-core = "0.8"
+wp-connector-api = "0.12"
+wp-model-core = "0.9"
 wp-log = "0.4"
-wp-conf-base = "0.4"
-wp-data-fmt = { version = "0.2", optional = true }
+wp-conf-base = "0.5"
+wp-data-fmt = { version = "0.9", optional = true }
 orion-error = "0.8"
 orion_conf = { version = "0.7", features = ["yaml", "toml"] }
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- 对齐 `wp-connector-api` 0.14 配套依赖：`wp-model-core` 0.10、`wp-log` 0.5、`wp-conf-base` 0.7、`wp-data-fmt` 0.10、`orion-error` 0.9、`orion_conf` 0.8。
+- 移除仓库中未使用的 `wp-connector-test-utils` 开发依赖，避免额外引入 `wp-connector-api` 0.13。
+
 ## [0.1.3] - 2026-05-04
 
 ### Changed

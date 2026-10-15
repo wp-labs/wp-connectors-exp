@@ -13,13 +13,13 @@ dmdb = []
 udp = ["wp-data-fmt"]
 
 [dependencies]
-wp-connector-api = "0.12"
-wp-model-core = "0.9"
-wp-log = "0.4"
-wp-conf-base = "0.5"
-wp-data-fmt = { version = "0.9", optional = true }
-orion-error = "0.8"
-orion_conf = { version = "0.7", features = ["yaml", "toml"] }
+wp-connector-api = "0.14"
+wp-model-core = "0.10"
+wp-log = "0.5"
+wp-conf-base = "0.7"
+wp-data-fmt = { version = "0.10", optional = true }
+orion-error = "0.9"
+orion_conf = { version = "0.8", features = ["yaml", "toml"] }
 
 async-trait = "0.1"
 log = "0.4"
@@ -35,7 +35,6 @@ thiserror = "2"
 hex = "0.4"
 
 [dev-dependencies]
-wp-connector-test-utils = { version = "0.2.0", git = "https://github.com/wp-labs/wp-connector-test-utils.git" }
 httpmock = "0.8"
 quickcheck = "1.0"
 quickcheck_macros = "1.0"

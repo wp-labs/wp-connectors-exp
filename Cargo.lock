@@ -185,17 +185,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
-name = "chacha20"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.3.0",
- "rand_core 0.10.1",
-]
-
-[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -229,15 +218,6 @@ name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "cpufeatures"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
 ]
@@ -1025,15 +1005,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ntapi"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
-dependencies = [
- "winapi",
-]
-
-[[package]]
 name = "num-bigint"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1168,16 +1139,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "objc2-io-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
-dependencies = [
- "libc",
- "objc2-core-foundation",
-]
-
-[[package]]
 name = "objc2-io-surface"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1248,9 +1209,9 @@ dependencies = [
 
 [[package]]
 name = "orion-error"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6fb344e4055f4f9507d475314c22e085ee3e6cc68643d48e3657f76abf88d01"
+checksum = "575552089359a03595b39776384dac800d02938e8821eadf2b57ccef28477044"
 dependencies = [
  "anyhow",
  "log",
@@ -1262,20 +1223,20 @@ dependencies = [
 
 [[package]]
 name = "orion-error-derive"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a191ed7c746d0bf64a6400b3e37b4c4bdd7a2ad82d260693424dd92a5d4d3eb"
+checksum = "e9864158ef9ac77e9540459781704e6706080bc3f795e7be2fbb8947b6d5e3dc"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "orion-variate"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03645f3e8e91eaf412d288f5806c4208ae9e98d0820f677973cb52aed5a6a1a5"
+checksum = "91afd0f7c782f20d22140988003e0e38fba6b84c1c3657ad8f0a6741fbac23dc"
 dependencies = [
  "derive-getters",
  "derive_more",
@@ -1291,9 +1252,9 @@ dependencies = [
 
 [[package]]
 name = "orion_conf"
-version = "0.7.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "088ee58d7784c683ca4b73f0c2f1c2c32f884b8cd5fddb49644fe4f1667a7145"
+checksum = "aa74ae1654b2c943a36dc97fc27a75ffc285ed8add633da2b16e7b8be0a42f0a"
 dependencies = [
  "derive-getters",
  "derive_more",
@@ -1458,7 +1419,6 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -1651,7 +1611,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
+ "cpufeatures",
  "digest",
 ]
 
@@ -1732,9 +1692,9 @@ checksum = "7b3c8667cd96245cbb600b8dec5680a7319edd719c5aa2b5d23c6bff94f39765"
 
 [[package]]
 name = "strum_macros"
-version = "0.27.2"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1773,20 +1733,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ab6a2f8bfe508deb3c6406578252e491d299cbbf3bc0529ecc3313aee4a52f"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "windows",
 ]
 
 [[package]]
@@ -2127,27 +2073,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
-name = "windows"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
-dependencies = [
- "windows-collections",
- "windows-core",
- "windows-future",
- "windows-numerics",
-]
-
-[[package]]
-name = "windows-collections"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
-dependencies = [
- "windows-core",
-]
-
-[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2158,17 +2083,6 @@ dependencies = [
  "windows-link",
  "windows-result",
  "windows-strings",
-]
-
-[[package]]
-name = "windows-future"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
-dependencies = [
- "windows-core",
- "windows-link",
- "windows-threading",
 ]
 
 [[package]]
@@ -2200,16 +2114,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
-name = "windows-numerics"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
-dependencies = [
- "windows-core",
- "windows-link",
-]
-
-[[package]]
 name = "windows-result"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2237,15 +2141,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-threading"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
-dependencies = [
- "windows-link",
-]
-
-[[package]]
 name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2262,9 +2157,9 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wp-conf-base"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "653c2f81c9b95a23d9e1c830f4b7df6c3722ef2b26a100de2fbd24b269cc4534"
+checksum = "1e097569ae90fcae6b93a8f7f347e634b1fb49af5b4cb4fb5de461f51b842e24"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -2275,15 +2170,15 @@ dependencies = [
  "serde",
  "toml",
  "winnow",
- "wp-connector-api 0.12.0",
- "wp-model-core 0.9.0",
+ "wp-connector-api",
+ "wp-model-core",
 ]
 
 [[package]]
 name = "wp-connector-api"
-version = "0.11.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89a3690372dd54afccbe7d3cb8f4809ecca80c9510c93682f9acbba09b0fb6dc"
+checksum = "a6da1ded3a8febb3c0b7d6d8bcbd5797aa38f3624e68226fddf4aeca1efc8d07"
 dependencies = [
  "async-broadcast",
  "async-trait",
@@ -2295,47 +2190,8 @@ dependencies = [
  "smallvec",
  "smol_str",
  "toml",
- "wp-model-core 0.8.9",
- "wp-source-types 0.1.1",
-]
-
-[[package]]
-name = "wp-connector-api"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a94ae81dc317e2579d79021c6b3d26449c2aba54c93356cb02b05de35535758e"
-dependencies = [
- "async-broadcast",
- "async-trait",
- "derive_more",
- "orion-error",
- "serde",
- "serde_derive",
- "serde_json",
- "smallvec",
- "smol_str",
- "toml",
- "wp-model-core 0.9.0",
- "wp-source-types 0.2.0",
-]
-
-[[package]]
-name = "wp-connector-test-utils"
-version = "0.2.3"
-source = "git+https://github.com/wp-labs/wp-connector-test-utils.git#5d4cc360acac15e38e5e7ac63384e7b9a5091792"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "derive_more",
- "orion-error",
- "rand 0.10.2",
- "serde",
- "serde_json",
- "sysinfo",
- "tokio",
- "wp-connector-api 0.11.2",
- "wp-model-core 0.8.9",
+ "wp-model-core",
+ "wp-source-types",
 ]
 
 [[package]]
@@ -2360,31 +2216,30 @@ dependencies = [
  "thiserror",
  "tokio",
  "wp-conf-base",
- "wp-connector-api 0.12.0",
- "wp-connector-test-utils",
+ "wp-connector-api",
  "wp-data-fmt",
  "wp-log",
- "wp-model-core 0.9.0",
+ "wp-model-core",
 ]
 
 [[package]]
 name = "wp-data-fmt"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "146341a23f0a86795bda12c40386f5036e7785aa4435ed45dedc07733746ed67"
+checksum = "269a7ef534f5724a08579789950778a0055cf4856c88bbb14a7b147a8286efd6"
 dependencies = [
  "chrono",
  "serde",
  "serde_json",
  "thiserror",
- "wp-model-core 0.9.0",
+ "wp-model-core",
 ]
 
 [[package]]
 name = "wp-log"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28c6bc038604182c1cff7a9837ba48fbde0c7a5d2be64f1f29c97a85d8aa1897"
+checksum = "21b92b3717a3e3669e78e4e47624d6f3f5d4f49578d6a33685b5b29bb89f7704"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2405,23 +2260,9 @@ dependencies = [
 
 [[package]]
 name = "wp-model-core"
-version = "0.8.9"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f83b80e35ad6c94ef72fea7f4f59e4cf3271f2946539d95b755aeea3446c589"
-dependencies = [
- "bytes",
- "chrono",
- "serde",
- "serde_derive",
- "smol_str",
- "thiserror",
-]
-
-[[package]]
-name = "wp-model-core"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33dfbf7eff94eb2db465f98b19b2da8789909c1272f3f7f84761bd3be7ca21f3"
+checksum = "84b11c54ccf20d7ead77a93d72b9d1ba3381b4c11c64e125c7bee26f3939244f"
 dependencies = [
  "bytes",
  "chrono",
@@ -2434,26 +2275,14 @@ dependencies = [
 
 [[package]]
 name = "wp-source-types"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c146480ccaeedaa5340f60dcb0a5b7a3b2e77c9c30b0c8e0f6ef5acfaa9e9e68"
+checksum = "4afda3c5898b731981a4e62934c13f43042505def3f5da1991eed904e46ecc59"
 dependencies = [
  "serde",
  "smallvec",
  "smol_str",
- "wp-model-core 0.8.9",
-]
-
-[[package]]
-name = "wp-source-types"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef24e9ee86b676f26d5c91c3cd384b0dcd1ce5b9291e0333af7859d3017b5946"
-dependencies = [
- "serde",
- "smallvec",
- "smol_str",
- "wp-model-core 0.9.0",
+ "wp-model-core",
 ]
 
 [[package]]
